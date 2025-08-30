@@ -4,7 +4,7 @@ from math import log
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
-import pytorch_lightning as pl
+import lightning as pl
 torch.set_float32_matmul_precision('medium')
 
 dataset_path = os.getcwd() + "\\datasets\\musicnet"
