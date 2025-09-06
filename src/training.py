@@ -205,16 +205,16 @@ class LitMusicModel(pl.LightningModule):
     best_val_acc: float
 
     def __init__(
-        self, model: nn.Module, optimizer: Optional[optim.Optimizer] = None,
+        self, model: nn.Module,
+        optimizer: Optional[optim.Optimizer] = None,
         scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
-        thresholds: list[float] = [0.5], allowed_errors: list[int] = [0],
+        allowed_errors: list[int] = [0],
     ) -> None:
         super().__init__()
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.loss_fn = nn.BCEWithLogitsLoss()
-        self.thresholds = thresholds
         self.allowed_errors = allowed_errors
         self.best_val_acc = 0
 
@@ -271,15 +271,24 @@ class LitMusicModel(pl.LightningModule):
         x, y = batch
         x, y = x.to(self.device), y.to(self.device)
         logits = self.model(x)  # (..., T, n_notes)
-        probs = torch.sigmoid(logits)
-        for t in self.thresholds:
-            for e in self.allowed_errors:
-                correct = torch.sum((probs >= t) != y.bool(), dim=-1) <= e
-                acc = 100 * torch.sum(correct) / correct.nelement()
-                self.log(
-                    f"Accuracy (t={t}, e={e})",
-                    acc, on_epoch=True, prog_bar=True,
-                )
+        # full case
+        for e in self.allowed_errors:
+            correct = torch.sum((logits >= 0) != y.bool(), dim=-1) <= e
+            acc = 100 * torch.sum(correct) / correct.nelement()
+            self.log(
+                f"Test accuracy (errors={e})",
+                acc, on_epoch=True, prog_bar=True,
+            )
+        # only notes case
+        label = y.unflatten(-1, (12, -1)).any(dim=-1)
+        pred = (logits.unflatten(-1, (12, -1)) >= 0).any(dim=-1)
+        for e in self.allowed_errors:
+            correct = torch.sum(pred != label, dim=-1) <= e
+            acc = 100 * torch.sum(correct) / correct.nelement()
+            self.log(
+                f"Test accuracy (errors={e}, only note names)",
+                acc, on_epoch=True, prog_bar=True,
+            )
 
 
 def train(
@@ -292,7 +301,7 @@ def train(
     gamma: float = 1,
     val_loader: Optional[DataLoader] = None,
 ) -> None:
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1*lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01*lr)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma)
     plmodel = pl_class(model, optimizer, scheduler)
     trainer = pl.Trainer(max_epochs=total_epochs, logger=False, enable_checkpointing=False)
@@ -303,7 +312,6 @@ def test(
     model: nn.Module,
     test_loader: DataLoader,
     pl_class: type = LitMusicModel,
-    thresholds: list[float] = [0.5],
     allowed_errors: list[int] = [0],
 ) -> None:
     """
@@ -311,9 +319,7 @@ def test(
     were fully correctly classified
     """
     trainer = pl.Trainer(logger=False, enable_checkpointing=False)
-    pl_model = pl_class(
-        model, thresholds=thresholds, allowed_errors=allowed_errors,
-    )
+    pl_model = pl_class(model, allowed_errors=allowed_errors)
     trainer.test(pl_model, test_loader)
 
 
@@ -335,19 +341,27 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')
     from dataloaders import create_dataloader
 
-    model = MusicModel(c=8, all_notes=True)
+    model = MusicModel(c=6, all_notes=True)
+    model.load_state_dict(torch.load("parameters\\dev_model_weights.pth"))
     train_loader = create_dataloader(split="train", batch_size=100)
     val_loader = create_dataloader(split="test", batch_size=32)
 
-    train(
+    # train(
+    #     model,
+    #     train_loader,
+    #     lr=0.004,
+    #     total_epochs=10,
+    #     pl_class=LitMusicModel,
+    #     milestones=[5],
+    #     gamma=0.4,
+    #     val_loader=val_loader,
+    # )
+
+    test(
         model,
-        train_loader,
-        lr=0.003,
-        total_epochs=10,
+        val_loader,
         pl_class=LitMusicModel,
-        milestones=[],
-        gamma=0.4,
-        val_loader=val_loader,
+        allowed_errors=[0, 1, 2],
     )
 
 
