@@ -1,6 +1,7 @@
+print("Importing packages...")
 from argparse import ArgumentParser
 from training import train, test, MusicModel, LitMusicModel, save, load
-from process_data import process_data, create_dataloader
+from preprocess_data import process_data, create_dataloader
 
 
 def parse_args():

@@ -5,9 +5,7 @@ paper: https://projects.iq.harvard.edu/files/kakade/files/1611-09827-2017.pdf
 ### Usage
 
 ```
-cd "C:\Users\sofia\OneDrive - Massachusetts Institute of Technology\Non-Academic\Programming"
-py_env\Scripts\activate
-python python_files\music 
+python src
 ```
 
 ### Arguments
