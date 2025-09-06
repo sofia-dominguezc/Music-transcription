@@ -64,6 +64,6 @@ def create_dataloader(
         "persistent_workers": True,
     } if num_workers > 0 else {}
     dataloader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=(split=="train"), **workers_args,
+        dataset, batch_size, shuffle=(split=="train"), **workers_args,
     )
     return dataloader

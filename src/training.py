@@ -1,15 +1,13 @@
-import os
-from typing import Any, Optional
-from math import log
+from typing import cast, Optional
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 import lightning as pl
-torch.set_float32_matmul_precision('medium')
 
-dataset_path = os.getcwd() + "\\datasets\\musicnet"
-model_weights = os.getcwd() + "\\parameters\\Music\\model_weights.pth"
-dev_model_weights = os.getcwd() + "\\parameters\\Music\\dev_model_weights.pth"
+from preprocess_data import save_path
+
+model_weights = "parameters\\model_weights.pth"
+dev_model_weights = "parameters\\dev_model_weights.pth"
 
 
 # class MusicModel(nn.Module):
@@ -142,65 +140,27 @@ class BatchDims(nn.Module):
 
 
 class MusicModel(nn.Module):
-    def __init__(
-        self, c: int, n_freq: int, all_notes: bool, n_time: int, n_heads: int,
-    ) -> None:
+    def __init__(self, c: int, all_notes: bool) -> None:
         super().__init__()
         n_notes = 12 * 8 if all_notes else 12
-        tm, oc, fq = 6, 2, 4  # out-reach of each dimension
-        # self.conv = nn.Sequential(
-        #     nn.Conv2d(1, c, (5, 9), padding=(2, 4), stride=(1, 2)),
-        #     nn.GELU(),
-        #     nn.Conv2d(c, c**2, (5, 5), padding=(2, 2), stride=(1, 2)),
-        #     nn.GELU(),
-        # )
-        # self.conv_3d = nn.Sequential(
-        #     nn.Unflatten(-1, (8, n_freq // 8)),  # num_octaves, bins_per_octave
-        #     nn.Conv3d(1, c, (5, 3, 9), padding=(2, 1, 4), stride=(1, 1, 2)),
-        #     nn.GELU(),
-        #     nn.Conv3d(c, 1, (5, 3, 5), padding=(2, 1, 2), stride=(1, 1, 2)),
-        #     # nn.GELU(),
-        #     nn.Flatten(-2, -1),
-        # )
-        # self.freq_conv = nn.Sequential(
-        #     nn.Unflatten(-1, (8, n_freq // 8)),
-        #     nn.Conv2d(1, c, (3, 7), padding=(1, 3), stride=(1, 2)),
-        #     nn.GELU(),
-        #     nn.Conv2d(c, c**2, (3, 5), padding=(1, 2), stride=(1, 2)),
-        #     # nn.GELU(),
-        #     nn.Flatten(-2, -1),
-        # )
-        self.iconv = nn.Sequential(  # (..., C, T, O*F)
-            nn.Conv3d(1, c//5, (2*tm+1, 2*oc+1, 2*fq+1), padding=(tm, oc, fq), stride=(1, 1, 2)),
+        tm, fq = 3, 3  # out-reach of each dimension (over 2)
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, c//2, kernel_size=(2*tm+1, 2*fq+1), padding=(tm, fq), stride=(1, 2)),
             nn.GELU(),
-            nn.Conv3d(c//5, c, (2*tm+1, 2*oc+1, fq+1), padding=(tm, oc, fq//2), stride=(1, 1, 2))
-            # nn.Linear(n_freq, c * (n_freq // 4)),
-            # nn.Unflatten(-1, (c, -1)),
-            # Transpose((-3, -2)),
+            nn.Conv2d(c//2, c, kernel_size=(2*tm+1, 2*fq+1), padding=(tm, fq), stride=(1, 2)),
+            nn.GELU(),
         )
-        self.tconv = nn.Sequential(
-            nn.Conv3d(c, 4*c, 1),
+
+        F = 8*12
+        self.linear = nn.Sequential(  # (..., C, T, F)
+            Transpose((-3, -2)),  # (..., T, C, F)
+            nn.Flatten(-2, -1),  # (..., T, c*F)
+            nn.Linear(c*F, c*F),
             nn.GELU(),
-            nn.Conv3d(4*c, 4*c, (2*tm+1, 1, 1), padding=(tm, 0, 0), groups=4*c),
-            nn.GELU(),
-            nn.Conv3d(4*c, c, 1),
+            nn.Linear(c*F, F),  # (..., T, F)
         )
-        self.oconv = nn.Sequential(
-            nn.Conv3d(c, 4*c, 1),
-            nn.GELU(),
-            nn.Conv3d(4*c, 4*c, (1, 2*oc+1, 1), padding=(0, oc, 0), groups=4*c),
-            nn.GELU(),
-            nn.Conv3d(4*c, c, 1),
-        )
-        self.fconv = nn.Sequential(
-            nn.Flatten(-2, -1),  # (..., C, T, O*F)
-            nn.Conv2d(c, 4*c, 1),
-            nn.GELU(),
-            nn.Conv2d(4*c, 4*c, fq//2+1, padding=fq//4, groups=4*c),
-            nn.GELU(),
-            nn.Conv2d(4*c, c, 1),
-            nn.Unflatten(-1, (8, -1)),  # (..., C, T, O, F)
-        )
+        # self.conv2 = nn.Conv2d(c + 2, 1, kernel_size=1)
         # self.linear = nn.Conv3d(c, 1, 1)
 
         # pe = positional_encoding(n_freq=n_freq//4, n_time=n_time)
@@ -215,13 +175,10 @@ class MusicModel(nn.Module):
         """
         x: (..., T, F)
         """
-        *BT, _ = x.shape
-        y = x.view(*BT, 8, -1).unsqueeze(-4)  # (*B, 1, T, O*F)
-        y = y[..., ::4] + self.iconv(y)  # (*B, C, T, O, F')
-        y = y + self.fconv(y)
-        y = y + self.oconv(y)
-        y = y + self.tconv(y)
-        return torch.max(y, dim=-4).values.view(*BT, -1)
+        y = x.unsqueeze(-3)  # (*B, 1, T, F)
+        y = y[..., ::4] + self.conv(y)
+        y = torch.max(y, dim=-3)[0] + self.linear(y)
+        return y
 
         # y = x.unsqueeze(-3)  # (..., 1, T, F)
         # z = y[..., ::4] + self.conv(y)  # (..., C, T, F')
@@ -245,6 +202,8 @@ class MusicModel(nn.Module):
 
 
 class LitMusicModel(pl.LightningModule):
+    best_val_acc: float
+
     def __init__(
         self, model: nn.Module, optimizer: Optional[optim.Optimizer] = None,
         scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
@@ -259,7 +218,7 @@ class LitMusicModel(pl.LightningModule):
         self.allowed_errors = allowed_errors
         self.best_val_acc = 0
 
-    def configure_optimizers(self) -> dict[str, Any]:
+    def configure_optimizers(self):  # type: ignore
         return {
             "optimizer": self.optimizer,
             "lr_scheduler": {
@@ -270,7 +229,9 @@ class LitMusicModel(pl.LightningModule):
         }
 
     def training_step(
-        self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor],
+        batch_idx: int,
     ) -> torch.Tensor:
         x, y = batch
         x, y = x.to(self.device), y.to(self.device)
@@ -299,10 +260,10 @@ class LitMusicModel(pl.LightningModule):
         self.log("val_acc", acc, on_epoch=True, prog_bar=True)
 
     def on_validation_epoch_end(self):
-        acc = self.trainer.callback_metrics.get('val_acc')
+        acc = self.trainer.callback_metrics['val_acc']
         if acc > self.best_val_acc:
             torch.save(self.model.state_dict(), dev_model_weights)
-            self.best_val_acc = acc
+            self.best_val_acc = acc.item()
 
     def test_step(
         self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int
@@ -327,14 +288,14 @@ def train(
     lr: float,
     total_epochs: int,
     pl_class: type = LitMusicModel,
-    milestones: Optional[list[int]] = None,
-    gamma: Optional[float] = 1,
+    milestones: list[int] = [],
+    gamma: float = 1,
     val_loader: Optional[DataLoader] = None,
 ) -> None:
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1*lr)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma)
     plmodel = pl_class(model, optimizer, scheduler)
-    trainer = pl.Trainer(max_epochs=total_epochs)
+    trainer = pl.Trainer(max_epochs=total_epochs, logger=False, enable_checkpointing=False)
     trainer.fit(plmodel, train_loader, val_loader)
 
 
@@ -349,7 +310,7 @@ def test(
     Checks the percentage of frames that
     were fully correctly classified
     """
-    trainer = pl.Trainer()
+    trainer = pl.Trainer(logger=False, enable_checkpointing=False)
     pl_model = pl_class(
         model, thresholds=thresholds, allowed_errors=allowed_errors,
     )
@@ -371,87 +332,23 @@ def save(model: nn.Module):
 
 
 if __name__ == "__main__":
-    pass
-    import numpy as np
-    # Test torch model
-    model = MusicModel(c=25, n_freq=8*48, all_notes=True, n_time=int(4 * 22050 / 512), n_heads=3)
-    load(model, dev=True)
-    model.cpu()
-    for name, p in model.named_parameters():
-        print(name, "\t", p.numel())
-    print(f"Total: {sum(p.numel() for p in model.parameters())}")
-    song = np.load(dataset_path + "\\train_data_npy\\1727.npy")
-    labels = np.load(dataset_path + "\\train_labels_npy\\1727.npy")
-    song = torch.from_numpy(song).to(torch.float32)
-    print(song.shape, song.dtype)
-    with torch.no_grad():
-        logits = model(song)
-    print(logits.shape, logits.dtype)
-    # print(logits[0])
-    # print(torch.max(100 * torch.sigmoid(logits), dim=-1).indices)
+    torch.set_float32_matmul_precision('medium')
+    from dataloaders import create_dataloader
 
-    import matplotlib.pyplot as plt
+    model = MusicModel(c=8, all_notes=True)
+    train_loader = create_dataloader(split="train", batch_size=100)
+    val_loader = create_dataloader(split="test", batch_size=32)
 
-    idx = 2
-    labels_arr = labels[idx].T
-    pred_arr = np.where(
-        torch.sigmoid(logits[idx]) >= 0.6,
-        torch.sigmoid(logits[idx]).cpu().numpy(),
-        0
-    ).T
-
-    # Create RGB image: green for labels, red for predictions, black for low values
-    img = np.zeros(labels_arr.shape + (3,), dtype=np.float32)
-    img[..., 0] = pred_arr  # Red channel for predictions
-    img[..., 2] = labels_arr  # Green channel for labels
-
-    plt.figure(figsize=(12, 8))
-
-    # Plot spectrogram (song[idx]) in decibels
-    plt.subplot(2, 1, 1)
-    plt.imshow(song[idx].T, aspect='auto', origin='lower')
-    plt.title("Spectrogram (dB)")
-    plt.ylabel("Frequency bins")
-    plt.xlabel("Frames")
-    # plt.yticks(
-    #     np.linspace(0, song[idx].shape[1] - 1, 4),
-    #     np.arange(0, song[idx].shape[1] // 4, 4),
-    # )
-    plt.colorbar(label="dB")
-
-    # Plot labels vs predictions
-    plt.subplot(2, 1, 2)
-    plt.imshow(img, aspect='auto', origin='lower')
-    plt.title("Labels (blue) vs Predictions (red)")
-    plt.ylabel("Notes")
-    plt.xlabel("Frames")
-
-    plt.tight_layout()
-    plt.show()
-
-    # # test pl model
-    # optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1*lr)
-    # scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma)
-    # pl_model = LitMusicModel(model, optimizer, scheduler)
-    # labels = np.load(dataset_path + "\\train_labels_npy\\1727.npy")
-    # labels = torch.from_numpy(labels).to(torch.float64)
-    # print(labels.shape, labels.dtype)
-    # with torch.no_grad():
-    #     loss, acc = pl_model.training_step((song, labels), 0)
-    #     print(loss, 100*acc)
-
-    # # Test dataloader
-    # from data_processing import create_dataloader
-    # train_loader = create_dataloader("train", batch_size, num_workers)
-    # for x, y in train_loader:
-    #     print(x.shape, x.dtype)
-    #     print(y.shape, y.dtype)
-    #     loss, acc = pl_model.training_step((x, y), 0)
-    #     print(loss, 100 * acc)
-    #     break
-
-    # # Test accuracy
-
+    train(
+        model,
+        train_loader,
+        lr=0.003,
+        total_epochs=10,
+        pl_class=LitMusicModel,
+        milestones=[],
+        gamma=0.4,
+        val_loader=val_loader,
+    )
 
 
 # Experiments:
@@ -476,3 +373,12 @@ if __name__ == "__main__":
 
 # make the frequency window larger
 # add the normal interpolated spectogram since features at high frequencies are bad
+
+
+# 3 IMPORANT FINDINGS
+
+# linear layers or long-range convolutions w.r.t. time are useless, but small ones help a bit
+
+# convolutions w.r.t. frequency must include at most 1.5 notes above/below
+
+# lr=0.04 is perfect for 1 epoch
