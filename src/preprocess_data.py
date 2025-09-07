@@ -48,7 +48,7 @@ def batched_q_transform(
     flat_spect = np.zeros((n_freq, n_batch * n_time))
     flat_spect[:, :n_full_time] = db_spect
     batched_spect = flat_spect.reshape((n_freq, n_batch, n_time))
-    batched_spect = np.transpose(batched_spect, (1, 2, 0))  # (batch, time, freq)
+    batched_spect = np.transpose(batched_spect, (1, 2, 0))  # (t_batch, time, freq)
     return batched_spect
 
 
