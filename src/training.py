@@ -1,10 +1,8 @@
-from typing import cast, Optional
+from typing import Optional
 import torch
-from torch import nn, optim
+from torch import nn, optim, Tensor
 from torch.utils.data import DataLoader
 import lightning as pl
-
-from preprocess_data import save_path
 
 model_weights = "parameters\\model_weights.pth"
 dev_model_weights = "parameters\\dev_model_weights.pth"
@@ -31,7 +29,7 @@ dev_model_weights = "parameters\\dev_model_weights.pth"
 #         )
 #         self.linear = nn.Linear(c * (n_freq // 4), n_notes)
 
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#     def forward(self, x: Tensor) -> Tensor:
 #         """
 #         x: (..., frames, freq)
 #         logits: (..., frames, n_notes)
@@ -52,7 +50,7 @@ dev_model_weights = "parameters\\dev_model_weights.pth"
 #         pe[:, 1::2] = torch.cos(position * div_term)
 #         self.register_buffer('pe', pe)
 
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#     def forward(self, x: Tensor) -> Tensor:
 #         """
 #         x: (..., C, T, F)
 #         Add positional encoding across time T for each frequency bin
@@ -68,52 +66,43 @@ dev_model_weights = "parameters\\dev_model_weights.pth"
 #     return pe
 
 
-# class SelfAttention(nn.Module):
-#     def __init__(self, n_freq: int, qk_dim: int, n_heads: int) -> None:
-#         super().__init__()
-#         assert qk_dim % n_heads == 0, "Head dims must divide evenly"
+class SelfAttention(nn.Module):
+    def __init__(self, input_dim: int, qk_dim: int, n_heads: int):
+        super().__init__()
+        assert qk_dim % n_heads == 0, "Head dims must divide evenly"
 
-#         self.qk_dim = qk_dim
-#         self.v_dim = qk_dim
-#         self.n_heads = n_heads
-#         self.qk_head_dim = qk_dim // n_heads
-#         self.v_head_dim = qk_dim // n_heads
+        self.qk_dim = qk_dim
+        self.v_dim = qk_dim
+        self.n_heads = n_heads
+        self.qk_head_dim = qk_dim // n_heads
+        self.v_head_dim = qk_dim // n_heads
 
-#         self.q_proj = nn.Linear(n_freq, qk_dim)
-#         self.k_proj = nn.Linear(n_freq, qk_dim)
-#         self.v_proj = nn.Linear(n_freq, qk_dim)
-#         self.out_proj = nn.Linear(qk_dim, n_freq)
+        self.q_proj = nn.Linear(input_dim, qk_dim)
+        self.k_proj = nn.Linear(input_dim, qk_dim)
+        self.v_proj = nn.Linear(input_dim, self.v_dim)
+        self.out_proj = nn.Linear(self.v_dim, input_dim)
 
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         x: shape (..., C, T, F)
-#         Attention is applied over T
-#         """
-#         orig_shape = x.shape  # (..., C, T, F)
-#         x = x.flatten(0, -3)  # [B*C, T, F]
-#         *BC_T, _ = x.shape
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: (batch, seq, input_dim)
+        Attention is applied over seq
+        """
+        Q = self.q_proj(x)  # [batch, seq, qk_dim]
+        K = self.k_proj(x)  # [batch, seq, qk_dim]
+        V = self.v_proj(x)  # [batch, seq, v_dim]
 
-#         Q = self.q_proj(x)  # [B*C, T, qk_dim]
-#         K = self.k_proj(x)  # [B*C, T, qk_dim]
-#         V = self.v_proj(x)  # [B*C, T, v_dim]
+        Q = Q.view(-1, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, qk_head_dim]
+        K = K.view(-1, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, qk_head_dim]
+        V = V.view(-1, self.n_heads, self.v_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, v_head_dim]
 
-#         # Reshape for multihead attention
-#         Q = Q.view(*BC_T, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [B*C, n_heads, T, qk_head_dim]
-#         K = K.view(*BC_T, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [B*C, n_heads, T, qk_head_dim]
-#         V = V.view(*BC_T, self.n_heads, self.v_head_dim).transpose(-2, -3)  # [B*C, n_heads, T, v_head_dim]
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.qk_head_dim ** 0.5)  # [batch, n_heads, seq, seq]
+        attn_weights = nn.functional.softmax(scores, dim=-1)  # [batch, n_heads, seq, seq]
+        attn_output = torch.matmul(attn_weights, V)  # [batch, n_heads, seq, v_head_dim]
+        attn_output = attn_output.transpose(-2, -3).contiguous().view(-1, self.v_dim)  # [batch, seq, v_dim]
 
-#         # Scaled dot-product attention
-#         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.qk_head_dim ** 0.5)  # [B*C, n_heads, T, T]
-#         attn_weights = nn.functional.softmax(scores, dim=-1)  # [B*C, n_heads, T, T]
-#         attn_output = torch.matmul(attn_weights, V)  # [B*C, n_heads, T, v_head_dim]
+        out = self.out_proj(attn_output)  # [batch, seq, input_dim]
+        return out
 
-#         # Concatenate heads
-#         attn_output = attn_output.transpose(-2, -3).contiguous().view(*BC_T, self.v_dim)  # [B*C, T, v_dim]
-
-#         # Final output projection back to n_freq
-#         out = self.out_proj(attn_output)  # [B*C, T, n_freq]
-#         out = out.view(*orig_shape)  # (..., C, T, F)
-#         return out
 
 class Transpose(nn.Module):
     """Transposes the desired pairs of dimensions in order"""
@@ -121,26 +110,26 @@ class Transpose(nn.Module):
         super().__init__()
         self.dims = dims
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         for dim0, dim1 in self.dims:
             x = x.transpose(dim0, dim1)
         return x
 
 
 class BatchDims(nn.Module):
-    """Batch all dimensions except the last 2 and then run the nn.Modules"""
-    def __init__(self, *args: nn.Module) -> None:
+    """Batch all dimensions except the last 2 and then runs the nn.Modules"""
+    def __init__(self, *args: nn.Module):
         super().__init__()
         self.nn_modules = nn.Sequential(*args)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         *B, C, L = x.shape
-        x = self.nn_modules(x.reshape(-1, C, L))
+        x = self.nn_modules(x.view(-1, C, L))
         return x.view(*B, C, L)
 
 
 class MusicModel(nn.Module):
-    def __init__(self, c: int, all_notes: bool) -> None:
+    def __init__(self, c: int, all_notes: bool):
         super().__init__()
         n_notes = 12 * 8 if all_notes else 12
         tm, fq = 3, 3  # out-reach of each dimension (over 2)
@@ -160,48 +149,67 @@ class MusicModel(nn.Module):
             nn.GELU(),
             nn.Linear(c*F, F),  # (..., T, F)
         )
-        # self.conv2 = nn.Conv2d(c + 2, 1, kernel_size=1)
-        # self.linear = nn.Conv3d(c, 1, 1)
 
-        # pe = positional_encoding(n_freq=n_freq//4, n_time=n_time)
-        # self.register_buffer('pe', pe)
-        # self.attn = SelfAttention(n_freq=n_freq//4, qk_dim=12*n_heads, n_heads=n_heads)
-
-        # self.linear1 = nn.Linear(n_freq // 4, n_notes)
-        # self.linear2 = nn.Linear(n_freq // 4, n_notes)
-        # self.linear3 = nn.Linear(n_freq // 2, n_notes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         """
-        x: (..., T, F)
+        x: (B, T, F)
         """
         y = x.unsqueeze(-3)  # (*B, 1, T, F)
         y = y[..., ::4] + self.conv(y)
         y = torch.max(y, dim=-3)[0] + self.linear(y)
         return y
 
-        # y = x.unsqueeze(-3)  # (..., 1, T, F)
-        # z = y[..., ::4] + self.conv(y)  # (..., C, T, F')
-        # w = y[..., ::4] + self.freq_conv(y)  # (..., C, T, F')
-        # z = y[..., ::4] + torch.max(self.linear1(z), dim=-3, keepdim=True).values  # (..., T, notes)
-        # w = y[..., ::4] + torch.max(self.linear2(w), dim=-3, keepdim=True).values  # (..., T, notes)
-        # out = torch.cat((z, w), dim=-3).transpose(-3, -2).flatten(-2, -1)
-        # return self.linear3(out)
 
-        # *B, T, F = x.shape
-        # x = x.reshape(-1, F).unsqueeze(-2)  # (B*T, 1, F)
-        # x = self.freq_conv(x)
-        # x = torch.max(x, dim=-2).values  # (B*T, F')
-        # return x.view(*B, T, -1)
+class MusicTransformer(nn.Module):
+    def __init__(self, n_layers: int = 2, n_heads: int = 4):
+        super().__init__()
+        self.time = 43  # time values in 1s
+        self.freq = 12*4  # freq values in 1 octave
+        input_dim = self.time * self.freq  # 2064
 
-        # B = x.shape[:-2]
-        # x = x + self.pe.expand(*x.shape[:-2], -1, -1)  # (..., C', T, F')
-        # x = x.flatten(0, -3)  # (... * C', T, F')
-        # x = x + self.attn(x)  # Self-attn over time
-        # x = x.unflatten(0, B) # (..., C', T, F')
+        self.pos_enc = nn.Conv2d(input_dim, input_dim, kernel_size=3, padding=1)
+
+        self.t_attn = nn.Sequential(
+            *(
+                SelfAttention(input_dim=input_dim, qk_dim=128*n_heads, n_heads=n_heads)
+                for _ in range(n_layers)
+            ),
+        )
+        self.f_attn = nn.Sequential(
+            *(
+                SelfAttention(input_dim=input_dim, qk_dim=128*n_heads, n_heads=n_heads)
+                for _ in range(n_layers)
+            ),
+        )
+        self.mlp = nn.Sequential(
+            *(nn.Sequential(
+                nn.Linear(input_dim, 4*input_dim),
+                nn.GELU(),
+                nn.Linear(4*input_dim, input_dim),
+            ) for _ in range(n_layers))
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: (t_batch, time, f_batch*freq)
+        Independent self-attentions over time and frequency
+        """
+        x = x.unflatten(-1, (8, -1))  # (t_batch, time, f_batch, freq)
+        x = x.transpose(1, 2).flatten(-2, -1)  # (t_batch, f_batch, input_dim)
+        x = x + self.pos_enc(x.transpose(0, 2)).transpose(0, 2)
+
+        for t_attn, f_attn, mlp in zip(self.t_attn, self.f_attn, self.mlp):
+            fx = f_attn(x)
+            tx = t_attn(x.transpose(0, 1)).transpose(0, 1)
+            x = x + tx + fx
+            x = x + mlp(x)
+
+        x = x.unflatten(-1, (self.time, self.freq))  # (t_batch, f_batch, time, freq)
+        return x.transpose(1, 2).flatten(-1)  # (t_batch, time, f_batch*freq)
 
 
 class LitMusicModel(pl.LightningModule):
+    loss_fn = nn.BCEWithLogitsLoss()
     best_val_acc: float
 
     def __init__(
@@ -214,7 +222,6 @@ class LitMusicModel(pl.LightningModule):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.loss_fn = nn.BCEWithLogitsLoss()
         self.allowed_errors = allowed_errors
         self.best_val_acc = 0
 
@@ -230,9 +237,9 @@ class LitMusicModel(pl.LightningModule):
 
     def training_step(
         self,
-        batch: tuple[torch.Tensor, torch.Tensor],
+        batch: tuple[Tensor, Tensor],
         batch_idx: int,
-    ) -> torch.Tensor:
+    ) -> Tensor:
         x, y = batch
         x, y = x.to(self.device), y.to(self.device)
         logits = self.model(x)  # (..., T, n_notes)
@@ -248,7 +255,7 @@ class LitMusicModel(pl.LightningModule):
             print(f"\nEpoch {self.current_epoch} - train_loss: {loss:.4f}")
 
     def validation_step(
-        self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int
+        self, batch: tuple[Tensor, Tensor], batch_idx: int
     ) -> None:
         x, y = batch
         x, y = x.to(self.device), y.to(self.device)
@@ -266,7 +273,7 @@ class LitMusicModel(pl.LightningModule):
             self.best_val_acc = acc.item()
 
     def test_step(
-        self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int
+        self, batch: tuple[Tensor, Tensor], batch_idx: int
     ) -> None:
         x, y = batch
         x, y = x.to(self.device), y.to(self.device)
