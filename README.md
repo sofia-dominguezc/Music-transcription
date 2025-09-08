@@ -60,3 +60,14 @@ TODO:
 
 TODO:
 - Make the system that processes a song and outputs the notes in real time.
+
+## Notes about transformer architecture
+
+lr=0.001 is optimal for n_layers=3, n_heads=4, head_dim=32, c=3, embed_dim=output_dim//3 (main model)
+- However, this architecture (2.3M params) overfits the data:
+    when train_loss > 6, then val_loss ~ train_loss
+    when train_loss < 6 (it got to 3.4 in 50 epochs), val_loss increases (up to 9 in this case)
+    validation accuracy is super bad always
+- This probably happens because 1/3 of the parameters are the positional encoding. This is dumb
+    Either use non-learnable positional encodings, or reduce number of params a lot
+    Another option is to make the model smaller

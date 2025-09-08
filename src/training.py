@@ -1,4 +1,4 @@
-from typing import Optional, Iterable, Callable
+from typing import Optional, Sequence
 import torch
 from torch import nn, optim, Tensor
 from torch.utils.data import DataLoader
@@ -56,21 +56,23 @@ class SelfAttention(nn.Module):
         mask: (batch, seq)
         Attention is applied over seq
         """
+        batch, seq, _ = x.shape
+
         Q = self.q_proj(x)  # [batch, seq, qk_dim]
         K = self.k_proj(x)  # [batch, seq, qk_dim]
         V = self.v_proj(x)  # [batch, seq, v_dim]
 
-        Q = Q.view(-1, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, qk_head_dim]
-        K = K.view(-1, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, qk_head_dim]
-        V = V.view(-1, self.n_heads, self.v_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, v_head_dim]
+        Q = Q.view(batch, seq, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, qk_head_dim]
+        K = K.view(batch, seq, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, qk_head_dim]
+        V = V.view(batch, seq, self.n_heads, self.v_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, v_head_dim]
 
         scores: Tensor = Q @ K.transpose(-2, -1) / (self.qk_head_dim ** 0.5)  # [batch, n_heads, seq, seq]
-        if mask:
+        if mask is not None:
             scores = scores.masked_fill(mask[:, None, None, :], value=float('-inf'))
 
         attn_weights = nn.functional.softmax(scores, dim=-1)  # [batch, n_heads, seq, seq]
         attn_output = torch.matmul(attn_weights, V)  # [batch, n_heads, seq, v_head_dim]
-        attn_output = attn_output.transpose(-2, -3).contiguous().view(-1, self.v_dim)  # [batch, seq, v_dim]
+        attn_output = attn_output.transpose(-2, -3).contiguous().view(batch, seq, self.v_dim)  # [batch, seq, v_dim]
 
         out = self.out_proj(attn_output)  # [batch, seq, input_dim]
         return out
@@ -119,10 +121,6 @@ class MusicModel(nn.Module):
         y = torch.max(y, dim=-3)[0] + self.linear(y)
         return y
 
-# ((x + 1) // 2 + 1) // 2
-# 0, 1, 1, 1
-# x // 4 + (x % 4 == 0)
-# (x + 3) // 4
 
 class MusicTransformer(nn.Module):
     """
@@ -133,15 +131,15 @@ class MusicTransformer(nn.Module):
         self,
         n_layers: int = 2,
         n_heads: int = 4,
-        head_dim: int = 64,
+        head_dim: int = 32,
         c: int = 3,
     ):
         super().__init__()
         self.time = 22050 // 512  # time values in 1s
         notes = 12
         self.freq = notes * 4  # freq values in 1 octave
-        output_dim = self.time * notes
-        embed_dim = output_dim // 4
+        output_dim = self.time * notes  # 516
+        embed_dim = output_dim // 3
 
         self.tokenizer = nn.Sequential(
             nn.Conv2d(1, c, kernel_size=5, padding=2, stride=2),
@@ -149,7 +147,7 @@ class MusicTransformer(nn.Module):
             nn.Conv2d(c, c**2, kernel_size=5, padding=2, stride=2),
             nn.GELU(),
             nn.Flatten(-3),
-            nn.Linear(c**2 * (self.time+3)//4 * (self.freq+3)//4, self.time * notes),
+            nn.Linear(c**2 * ((self.time+3)//4) * ((self.freq+3)//4), embed_dim),
         )
         self.pos_enc = nn.Conv2d(embed_dim, embed_dim, kernel_size=5, padding=2)
         self.decoder = nn.Linear(embed_dim, output_dim)
@@ -192,7 +190,7 @@ class MusicTransformer(nn.Module):
 
         batch, t_batch, f_batch = x.shape[:3]
         mask = mask.view(batch, t_batch, -1)  # (batch, t_batch, time)
-        assert mask.max(dim=-1) == mask.min(dim=-1), "Mask is not constant over seconds"
+        assert torch.equal(mask.max(dim=-1)[0], mask.min(dim=-1)[0]), "Mask is not constant over seconds"
         mask = mask[:, None, :, 0].repeat((f_batch, 1, 1)).flatten(0, 1)  # (batch*f_batch, t_batch)
 
         for t_attn, f_attn, mlp, ln in zip(self.t_attn, self.f_attn, self.mlp, self.layer_norm):
@@ -204,25 +202,28 @@ class MusicTransformer(nn.Module):
 
         x = self.decoder(x)  # (batch, t_batch, f_batch, output_dim)
         x = x.unflatten(-1, (self.time, -1))  # (batch, t_batch, f_batch, time, notes)
-        return x.transpose(-3, -2).flatten(-1).flatten(-2)  # (batch, t_batch*time, f_batch*notes)
+        return x.transpose(-3, -2).flatten(-2, -1).flatten(-3, -2)  # (batch, t_batch*time, f_batch*notes)
 
 
 class LitMusicModel(pl.LightningModule):
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.BCEWithLogitsLoss(reduction='none')
     best_val_acc: float
 
     def __init__(
-        self, model: nn.Module,
+        self,
+        model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
         scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
         allowed_errors: list[int] = [0],
+        params_root: str = ".",
     ) -> None:
         super().__init__()
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.allowed_errors = allowed_errors
-        self.best_val_acc = 0
+        self.params_root = params_root
+        self.best_train_loss = float('inf')
 
     def configure_optimizers(self):  # type: ignore
         return {
@@ -234,66 +235,81 @@ class LitMusicModel(pl.LightningModule):
             }
         }
 
+    def _loss(self, X: Sequence[Tensor], y: Tensor, logits: Tensor) -> Tensor:
+        if len(X) == 1:
+            return torch.mean(self.loss_fn(logits, y))
+        else:
+            x, mask = X
+            mask = mask[:, :, None]
+            loss = self.loss_fn(logits, y) * ~mask
+            return torch.sum(loss) / (torch.sum(~mask) * y.shape[-1])
+
     def training_step(
         self,
         batch: tuple[Tensor, ...],
         batch_idx: int,
     ) -> Tensor:
-        *x, y = [el.to(self.device) for el in batch]
-        logits = self.model(*x)  # (..., T, n_notes)
-        loss = self.loss_fn(logits, y)
+        *X, y = [el.to(self.device) for el in batch]
+        logits = self.model(*X)
+        loss = self._loss(X, y, logits)
 
         self.log("loss_step", 100 * loss, on_epoch=False, prog_bar=True)
         self.log("loss_epoch", 100 * loss, on_epoch=True, prog_bar=False)
         return loss
 
     def on_train_epoch_end(self):
-        loss = self.trainer.callback_metrics.get('loss_epoch')
-        if loss is not None:
-            print(f"\nEpoch {self.current_epoch} - train_loss: {loss:.4f}")
+        loss = self.trainer.callback_metrics['loss_epoch']
+        print(f"\nEpoch {self.current_epoch} - train_loss: {loss:.4f}")
+        if loss < self.best_train_loss:
+            torch.save(self.model.state_dict(), f"{self.params_root}\\{dev_model_weights}")
+            self.best_train_loss = loss.item()
 
     def validation_step(
         self, batch: tuple[Tensor, Tensor], batch_idx: int
     ) -> None:
-        *x, y = [el.to(self.device) for el in batch]
-        logits = self.model(*x)  # (..., T, n_notes)
-        loss = self.loss_fn(logits, y)
-        correct = torch.sum((logits >= 0) != y.bool(), dim=-1) == 0
-        acc = 100 * torch.sum(correct) / correct.nelement()
+        *X, y = [el.to(self.device) for el in batch]
+        logits = self.model(*X)  # (..., T, n_notes)
+        loss = self._loss(X, y, logits)
+        acc = self._acc(X, y, logits, e=0)
         self.log("val_loss", 100 * loss, on_epoch=True, prog_bar=True)
         self.log("val_acc", acc, on_epoch=True, prog_bar=True)
 
-    def on_validation_epoch_end(self):
-        acc = self.trainer.callback_metrics['val_acc']
-        if acc > self.best_val_acc:
-            torch.save(self.model.state_dict(), dev_model_weights)
-            self.best_val_acc = acc.item()
+    def _acc(self, X: Sequence[Tensor], y: Tensor, logits: Tensor, e: int = 0) -> float:
+        """Find fraction of time steps that are fully correctly classified"""
+        if len(X) == 1:
+            correct = torch.sum((logits >= 0) != y.bool(), dim=-1) <= e  # (batch, time)
+            acc = torch.sum(correct) / correct.nelement()
+            return 100 * acc.item()
+        else:
+            _, mask = X
+            correct = torch.sum((logits >= 0) != y.bool(), dim=-1) <= e
+            acc = torch.sum(correct & ~mask) / torch.sum(~mask)
+            return 100 * acc.item()
 
     def test_step(
         self,
         batch: tuple[Tensor, ...],
         batch_idx: int,
     ) -> None:
-        *x, y = [el.to(self.device) for el in batch]
-        logits = self.model(*x)  # (..., T, n_notes)
+        *X, y = [el.to(self.device) for el in batch]
+        logits = self.model(*X)  # (batch, time, notes)
         # full case
         for e in self.allowed_errors:
-            correct = torch.sum((logits >= 0) != y.bool(), dim=-1) <= e
-            acc = 100 * torch.sum(correct) / correct.nelement()
+            acc = self._acc(X, y, logits, e=e)
             self.log(
                 f"Test accuracy (errors={e})",
                 acc, on_epoch=True, prog_bar=True,
             )
-        # only notes case
-        label = y.unflatten(-1, (12, -1)).any(dim=-1)
-        pred = (logits.unflatten(-1, (12, -1)) >= 0).any(dim=-1)
-        for e in self.allowed_errors:
-            correct = torch.sum(pred != label, dim=-1) <= e
-            acc = 100 * torch.sum(correct) / correct.nelement()
-            self.log(
-                f"Test accuracy (errors={e}, only note names)",
-                acc, on_epoch=True, prog_bar=True,
-            )
+        # # only notes case
+        # label = y.unflatten(-1, (12, -1)).any(dim=-1)
+        # pred = (logits.unflatten(-1, (12, -1)) >= 0).any(dim=-1)
+        # for e in self.allowed_errors:
+        #     correct = torch.sum(pred != label, dim=-1) <= e
+        #     acc = 100 * torch.sum(correct) / correct.nelement()
+        #     self.log(
+        #         f"Test accuracy (errors={e}, only note names)",
+        #         acc, on_epoch=True, prog_bar=True,
+        #     )
 
 
 def train(
@@ -304,10 +320,11 @@ def train(
     milestones: list[int] = [],
     gamma: float = 1,
     val_loader: Optional[DataLoader] = None,
+    params_root: str = ".",
 ) -> None:
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01*lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=10*lr)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma)
-    plmodel = LitMusicModel(model, optimizer, scheduler)
+    plmodel = LitMusicModel(model, optimizer, scheduler, params_root=params_root)
     trainer = pl.Trainer(max_epochs=total_epochs, logger=False, enable_checkpointing=False)
     trainer.fit(plmodel, train_loader, val_loader)
 
@@ -342,19 +359,19 @@ def save(model: nn.Module):
 
 if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')
-    from dataloaders import create_dataloader
+    from dataloaders import create_lazy_dataloader
 
-    model = MusicTransformer(n_layers=2, n_heads=4, head_dim=32, c=3)
+    model = MusicTransformer(n_layers=3, n_heads=4, head_dim=32, c=3)
     # model.load_state_dict(torch.load("parameters\\dev_model_weights.pth"))
-    train_loader = create_dataloader(split="train", batch_size=32, num_workers=8)
-    val_loader = create_dataloader(split="test", batch_size=32, num_workers=8)
+    train_loader = create_lazy_dataloader(split="train", batch_size=16, num_workers=16)
+    val_loader = create_lazy_dataloader(split="test", batch_size=8, num_workers=2)
 
     train(
         model,
         train_loader,
-        lr=0.004,
-        total_epochs=1,
-        milestones=[5],
+        lr=0.001,
+        total_epochs=50,
+        milestones=[],
         gamma=0.4,
         val_loader=val_loader,
     )
