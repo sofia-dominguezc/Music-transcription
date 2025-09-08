@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Iterable, Callable
 import torch
 from torch import nn, optim, Tensor
 from torch.utils.data import DataLoader
@@ -7,38 +7,6 @@ import lightning as pl
 model_weights = "parameters\\model_weights.pth"
 dev_model_weights = "parameters\\dev_model_weights.pth"
 
-
-# class MusicModel(nn.Module):
-#     """
-#     Model that takes a spectogram of shape (frames, freq) and returns
-#     an array (frames, n_notes) where at each time is the probability distribuion
-#     of possible notes.
-#     """
-#     def __init__(
-#         self, c: int, n_freq: int, all_notes: bool,
-#     ) -> None:
-#         """
-#         c: multiplier of features
-#         """
-#         super().__init__()
-#         n_notes = 12 * 8 if all_notes else 12
-#         self.conv = nn.Sequential(
-#             nn.Conv2d(1, c, (5, 9), padding=(2, 4)),
-#             nn.GELU(),
-#             nn.MaxPool2d((1, 4)),
-#         )
-#         self.linear = nn.Linear(c * (n_freq // 4), n_notes)
-
-#     def forward(self, x: Tensor) -> Tensor:
-#         """
-#         x: (..., frames, freq)
-#         logits: (..., frames, n_notes)
-#         """
-#         x = x.unsqueeze(-3)  # (..., 1, T, F)
-#         x = self.conv(x)  # (..., C, T, F)
-#         x = x.transpose(-2, -3).flatten(-2, -1)  # (..., T, C*F)
-#         x = self.linear(x)  # (..., T, n_notes)
-#         return x
 
 # class PositionalEncoding(nn.Module):
 #     def __init__(self, n_freq: int, n_time: int) -> None:
@@ -82,9 +50,10 @@ class SelfAttention(nn.Module):
         self.v_proj = nn.Linear(input_dim, self.v_dim)
         self.out_proj = nn.Linear(self.v_dim, input_dim)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         """
         x: (batch, seq, input_dim)
+        mask: (batch, seq)
         Attention is applied over seq
         """
         Q = self.q_proj(x)  # [batch, seq, qk_dim]
@@ -95,7 +64,10 @@ class SelfAttention(nn.Module):
         K = K.view(-1, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, qk_head_dim]
         V = V.view(-1, self.n_heads, self.v_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, v_head_dim]
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.qk_head_dim ** 0.5)  # [batch, n_heads, seq, seq]
+        scores: Tensor = Q @ K.transpose(-2, -1) / (self.qk_head_dim ** 0.5)  # [batch, n_heads, seq, seq]
+        if mask:
+            scores = scores.masked_fill(mask[:, None, None, :], value=float('-inf'))
+
         attn_weights = nn.functional.softmax(scores, dim=-1)  # [batch, n_heads, seq, seq]
         attn_output = torch.matmul(attn_weights, V)  # [batch, n_heads, seq, v_head_dim]
         attn_output = attn_output.transpose(-2, -3).contiguous().view(-1, self.v_dim)  # [batch, seq, v_dim]
@@ -114,18 +86,6 @@ class Transpose(nn.Module):
         for dim0, dim1 in self.dims:
             x = x.transpose(dim0, dim1)
         return x
-
-
-class BatchDims(nn.Module):
-    """Batch all dimensions except the last 2 and then runs the nn.Modules"""
-    def __init__(self, *args: nn.Module):
-        super().__init__()
-        self.nn_modules = nn.Sequential(*args)
-
-    def forward(self, x: Tensor) -> Tensor:
-        *B, C, L = x.shape
-        x = self.nn_modules(x.view(-1, C, L))
-        return x.view(*B, C, L)
 
 
 class MusicModel(nn.Module):
@@ -159,53 +119,92 @@ class MusicModel(nn.Module):
         y = torch.max(y, dim=-3)[0] + self.linear(y)
         return y
 
+# ((x + 1) // 2 + 1) // 2
+# 0, 1, 1, 1
+# x // 4 + (x % 4 == 0)
+# (x + 3) // 4
 
 class MusicTransformer(nn.Module):
-    def __init__(self, n_layers: int = 2, n_heads: int = 4):
+    """
+    The architecture was inspired by a Vision Transformer,
+    except that it uses criss-cross attention instead of full attention
+    """
+    def __init__(
+        self,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        head_dim: int = 64,
+        c: int = 3,
+    ):
         super().__init__()
-        self.time = 43  # time values in 1s
-        self.freq = 12*4  # freq values in 1 octave
-        input_dim = self.time * self.freq  # 2064
+        self.time = 22050 // 512  # time values in 1s
+        notes = 12
+        self.freq = notes * 4  # freq values in 1 octave
+        output_dim = self.time * notes
+        embed_dim = output_dim // 4
 
-        self.pos_enc = nn.Conv2d(input_dim, input_dim, kernel_size=3, padding=1)
+        self.tokenizer = nn.Sequential(
+            nn.Conv2d(1, c, kernel_size=5, padding=2, stride=2),
+            nn.GELU(),
+            nn.Conv2d(c, c**2, kernel_size=5, padding=2, stride=2),
+            nn.GELU(),
+            nn.Flatten(-3),
+            nn.Linear(c**2 * (self.time+3)//4 * (self.freq+3)//4, self.time * notes),
+        )
+        self.pos_enc = nn.Conv2d(embed_dim, embed_dim, kernel_size=5, padding=2)
+        self.decoder = nn.Linear(embed_dim, output_dim)
 
-        self.t_attn = nn.Sequential(
-            *(
-                SelfAttention(input_dim=input_dim, qk_dim=128*n_heads, n_heads=n_heads)
+        self.t_attn = nn.ModuleList(
+            (
+                SelfAttention(input_dim=embed_dim, qk_dim=head_dim*n_heads, n_heads=n_heads)
                 for _ in range(n_layers)
             ),
         )
-        self.f_attn = nn.Sequential(
-            *(
-                SelfAttention(input_dim=input_dim, qk_dim=128*n_heads, n_heads=n_heads)
+        self.f_attn = nn.ModuleList(
+            (
+                SelfAttention(input_dim=embed_dim, qk_dim=head_dim*n_heads, n_heads=n_heads)
                 for _ in range(n_layers)
             ),
         )
-        self.mlp = nn.Sequential(
-            *(nn.Sequential(
-                nn.Linear(input_dim, 4*input_dim),
-                nn.GELU(),
-                nn.Linear(4*input_dim, input_dim),
-            ) for _ in range(n_layers))
+        self.layer_norm = nn.ModuleList(
+            (nn.LayerNorm(embed_dim) for _ in range(n_layers))
+        )
+        self.mlp = nn.ModuleList(
+            (
+                nn.Sequential(
+                    nn.Linear(embed_dim, 4*embed_dim),
+                    nn.GELU(),
+                    nn.Linear(4*embed_dim, embed_dim),
+                ) for _ in range(n_layers)
+            ),
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, mask: Tensor) -> Tensor:
         """
-        x: (t_batch, time, f_batch*freq)
+        x: (batch, t_batch*time, f_batch*freq)
+        mask: (batch, t_batch*time)
         Independent self-attentions over time and frequency
         """
-        x = x.unflatten(-1, (8, -1))  # (t_batch, time, f_batch, freq)
-        x = x.transpose(1, 2).flatten(-2, -1)  # (t_batch, f_batch, input_dim)
-        x = x + self.pos_enc(x.transpose(0, 2)).transpose(0, 2)
+        x = x.unflatten(-2, (-1, self.time)).unflatten(-1, (-1, self.freq))  # (B, tB, t, fB, f)
+        x = x.transpose(-3, -2).unsqueeze(3)  # (batch, t_batch, f_batch, 1, time, freq)
+        x = self.tokenizer(x.flatten(0, 2)).view(*x.shape[:3], -1)  # (batch, t_batch, f_batch, embed_dim)
+        x = x + self.pos_enc(x.transpose(-1, -3)).transpose(-1, -3)
 
-        for t_attn, f_attn, mlp in zip(self.t_attn, self.f_attn, self.mlp):
-            fx = f_attn(x)
-            tx = t_attn(x.transpose(0, 1)).transpose(0, 1)
+        batch, t_batch, f_batch = x.shape[:3]
+        mask = mask.view(batch, t_batch, -1)  # (batch, t_batch, time)
+        assert mask.max(dim=-1) == mask.min(dim=-1), "Mask is not constant over seconds"
+        mask = mask[:, None, :, 0].repeat((f_batch, 1, 1)).flatten(0, 1)  # (batch*f_batch, t_batch)
+
+        for t_attn, f_attn, mlp, ln in zip(self.t_attn, self.f_attn, self.mlp, self.layer_norm):
+            x = ln(x)
+            fx = f_attn(x.flatten(0, 1)).unflatten(0, (batch, t_batch))
+            tx = t_attn(x.transpose(1, 2).flatten(0, 1), mask).unflatten(0, (batch, f_batch)).transpose(1, 2)
             x = x + tx + fx
             x = x + mlp(x)
 
-        x = x.unflatten(-1, (self.time, self.freq))  # (t_batch, f_batch, time, freq)
-        return x.transpose(1, 2).flatten(-1)  # (t_batch, time, f_batch*freq)
+        x = self.decoder(x)  # (batch, t_batch, f_batch, output_dim)
+        x = x.unflatten(-1, (self.time, -1))  # (batch, t_batch, f_batch, time, notes)
+        return x.transpose(-3, -2).flatten(-1).flatten(-2)  # (batch, t_batch*time, f_batch*notes)
 
 
 class LitMusicModel(pl.LightningModule):
@@ -237,12 +236,11 @@ class LitMusicModel(pl.LightningModule):
 
     def training_step(
         self,
-        batch: tuple[Tensor, Tensor],
+        batch: tuple[Tensor, ...],
         batch_idx: int,
     ) -> Tensor:
-        x, y = batch
-        x, y = x.to(self.device), y.to(self.device)
-        logits = self.model(x)  # (..., T, n_notes)
+        *x, y = [el.to(self.device) for el in batch]
+        logits = self.model(*x)  # (..., T, n_notes)
         loss = self.loss_fn(logits, y)
 
         self.log("loss_step", 100 * loss, on_epoch=False, prog_bar=True)
@@ -257,9 +255,8 @@ class LitMusicModel(pl.LightningModule):
     def validation_step(
         self, batch: tuple[Tensor, Tensor], batch_idx: int
     ) -> None:
-        x, y = batch
-        x, y = x.to(self.device), y.to(self.device)
-        logits = self.model(x)  # (..., T, n_notes)
+        *x, y = [el.to(self.device) for el in batch]
+        logits = self.model(*x)  # (..., T, n_notes)
         loss = self.loss_fn(logits, y)
         correct = torch.sum((logits >= 0) != y.bool(), dim=-1) == 0
         acc = 100 * torch.sum(correct) / correct.nelement()
@@ -273,11 +270,12 @@ class LitMusicModel(pl.LightningModule):
             self.best_val_acc = acc.item()
 
     def test_step(
-        self, batch: tuple[Tensor, Tensor], batch_idx: int
+        self,
+        batch: tuple[Tensor, ...],
+        batch_idx: int,
     ) -> None:
-        x, y = batch
-        x, y = x.to(self.device), y.to(self.device)
-        logits = self.model(x)  # (..., T, n_notes)
+        *x, y = [el.to(self.device) for el in batch]
+        logits = self.model(*x)  # (..., T, n_notes)
         # full case
         for e in self.allowed_errors:
             correct = torch.sum((logits >= 0) != y.bool(), dim=-1) <= e
@@ -303,14 +301,13 @@ def train(
     train_loader: DataLoader,
     lr: float,
     total_epochs: int,
-    pl_class: type = LitMusicModel,
     milestones: list[int] = [],
     gamma: float = 1,
     val_loader: Optional[DataLoader] = None,
 ) -> None:
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01*lr)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma)
-    plmodel = pl_class(model, optimizer, scheduler)
+    plmodel = LitMusicModel(model, optimizer, scheduler)
     trainer = pl.Trainer(max_epochs=total_epochs, logger=False, enable_checkpointing=False)
     trainer.fit(plmodel, train_loader, val_loader)
 
@@ -318,7 +315,6 @@ def train(
 def test(
     model: nn.Module,
     test_loader: DataLoader,
-    pl_class: type = LitMusicModel,
     allowed_errors: list[int] = [0],
 ) -> None:
     """
@@ -326,7 +322,7 @@ def test(
     were fully correctly classified
     """
     trainer = pl.Trainer(logger=False, enable_checkpointing=False)
-    pl_model = pl_class(model, allowed_errors=allowed_errors)
+    pl_model = LitMusicModel(model, allowed_errors=allowed_errors)
     trainer.test(pl_model, test_loader)
 
 
@@ -338,8 +334,8 @@ def load(model: nn.Module, dev: bool = False):
 
 def save(model: nn.Module):
     """
-    Saves the model into 'model_weights'. This is special
-    because this file is reserved for the best model so far.
+    Saves the model into 'model_weights'
+    This file is reserved for the best model so far.
     """
     torch.save(model.state_dict(), model_weights)
 
@@ -348,26 +344,24 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')
     from dataloaders import create_dataloader
 
-    model = MusicModel(c=6, all_notes=True)
-    model.load_state_dict(torch.load("parameters\\dev_model_weights.pth"))
-    train_loader = create_dataloader(split="train", batch_size=100)
-    val_loader = create_dataloader(split="test", batch_size=32)
+    model = MusicTransformer(n_layers=2, n_heads=4, head_dim=32, c=3)
+    # model.load_state_dict(torch.load("parameters\\dev_model_weights.pth"))
+    train_loader = create_dataloader(split="train", batch_size=32, num_workers=8)
+    val_loader = create_dataloader(split="test", batch_size=32, num_workers=8)
 
-    # train(
-    #     model,
-    #     train_loader,
-    #     lr=0.004,
-    #     total_epochs=10,
-    #     pl_class=LitMusicModel,
-    #     milestones=[5],
-    #     gamma=0.4,
-    #     val_loader=val_loader,
-    # )
+    train(
+        model,
+        train_loader,
+        lr=0.004,
+        total_epochs=1,
+        milestones=[5],
+        gamma=0.4,
+        val_loader=val_loader,
+    )
 
     test(
         model,
         val_loader,
-        pl_class=LitMusicModel,
         allowed_errors=[0, 1, 2],
     )
 

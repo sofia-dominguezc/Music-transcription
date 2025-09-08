@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch.utils.data import Dataset, DataLoader
 from typing import Literal
 
@@ -40,13 +40,15 @@ class GroupedTensorDataset(Dataset[tuple[Tensor, Tensor]]):
         return x_tensor, y_tensor
 
 
-class LazyTensorDataset(Dataset[tuple[Tensor, Tensor]]):
+class LazyTensorDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
     """Stores a list of files (e.g. ["1727", "1728"]) and loads in __getitem__"""
+    max_time = 90 * (22050 // 512)  # max batch size is 90s
+
     def __init__(
         self,
         files: list[str],
         split: Literal["train", "test"],
-        root: str = "data\\musicnet_processed",
+        root: str = save_path,
     ):
         self.files = files
         self.split = split
@@ -55,7 +57,13 @@ class LazyTensorDataset(Dataset[tuple[Tensor, Tensor]]):
     def __len__(self) -> int:
         return len(self.files)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Returns:
+            x_padded: (max_time, freq)
+            mask: (max_time, )
+            y_padded: (max_time, notes)
+        """
         x_file = f"{self.root}\\{self.split}_data\\{self.files[index]}.npy"
         x_array = np.load(x_file)
         x_tensor = torch.from_numpy(x_array).to(torch.float32)
@@ -64,7 +72,16 @@ class LazyTensorDataset(Dataset[tuple[Tensor, Tensor]]):
         y_array = np.load(y_file)
         y_tensor = torch.from_numpy(y_array).to(torch.float64)
 
-        return x_tensor, y_tensor
+        seq_len = x_tensor.shape[0]
+        pad_len = self.max_time - seq_len
+        assert pad_len >= 0, "Sequence length larger than max_time"
+
+        x_padded = nn.functional.pad(x_tensor, (0, 0, 0, pad_len), value=0)
+        y_padded = nn.functional.pad(y_tensor, (0, 0, 0, pad_len), value=0)
+        mask = torch.zeros(self.max_time, dtype=torch.bool)
+        mask[seq_len:] = True
+
+        return x_padded, mask, y_padded
 
 
 def create_dataloader(
@@ -103,7 +120,8 @@ def create_lazy_dataloader(
     split: Literal["train", "test"],
     batch_size: int,
     num_workers: int = 0,
-) -> DataLoader[tuple[Tensor, Tensor]]:
+    root: str = save_path,
+) -> DataLoader[tuple[Tensor, ...]]:
     """
     Make "lazy" dataloader from a list of song files.
     Note that each element in the dataloader will be a whole song.
@@ -111,11 +129,11 @@ def create_lazy_dataloader(
     torch.cuda.empty_cache()
 
     files = []
-    for f in os.listdir(os.fsencode(f"{save_path}\\{split}_data")):
+    for f in os.listdir(os.fsencode(f"{root}\\{split}_data")):
         file = os.fsdecode(f)
         assert file.endswith(".npy"), f"Invalid file: {file}"
         files.append(file[:-len(".npy")])
-    dataset = LazyTensorDataset(files, split)
+    dataset = LazyTensorDataset(files, split, root=root)
 
     workers_args = {
         "num_workers": num_workers,

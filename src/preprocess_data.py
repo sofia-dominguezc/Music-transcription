@@ -1,30 +1,57 @@
 import os
-from math import ceil
 import pandas as pd
 import numpy as np
 import librosa
 from concurrent import futures
 from tqdm import tqdm
+from typing import Literal
 
 dataset_path = "data\\musicnet"
 save_path = "data\\musicnet_processed"
+n_octaves = 8
 
-# NOTE: sampling rate assumptions are hard coded
-# Songs are asssumed to have 22050 and labels are in 44100
+# NOTE: songs are asssumed to have sr=22050 and labels are in 44100
 
 
-def load_song(song: str, split: str) -> np.ndarray:
+def load_song(song: str, split: Literal["train", "test"]) -> np.ndarray:
     """Load song"""
-    assert split in ["train", "test"], "Invalid split"
     song_path = f"{dataset_path}\\{split}_data\\{song}.wav"
     song_vals, song_sr = librosa.load(song_path)
-    assert song_sr == 22050
+    assert song_sr == 22050, "Invalid sr"
     return song_vals
+
+
+def optimal_batch_size(
+    total_length: int,
+    ideal_batch: int,
+    multiple: int = 1,
+    lower_mult: float = 0.66,
+    upper_mult: float = 1.5,
+) -> int:
+    """
+    Find batch size close to ideal_batch that would result in cropping
+    the least possible from the ends of a series of length total_length
+
+    Args:
+        total_length: length of sequence to partition
+        ideal_batch: ideal batch size to use
+        multiple: condition possible batch sizes to be a multiple of this
+        lower_mult: minimum multiplier of ideal_batch to consider
+        upper_mult: maximum multiplier of ideal_batch to consider
+    """
+    options = [
+        multiple * small_opt for small_opt in range(
+            int(lower_mult * ideal_batch / multiple), int(upper_mult * ideal_batch / multiple)
+        )
+    ]
+    min_res = min(total_length % opt for opt in options)
+    optimal_options = [opt for opt in options if total_length % opt == min_res]
+    return min((abs(opt - ideal_batch), opt) for opt in optimal_options)[1]
 
 
 def batched_q_transform(
     song_vals: np.ndarray,
-    batch_seconds: float,
+    batch_seconds: int,
     bins_per_note: int,
     sr: int,
     hop_length: int,
@@ -34,27 +61,24 @@ def batched_q_transform(
     The constant q-transform is like a FT but logarithmic in frequency.
     """
     # spectogram
-    spect = np.abs(librosa.cqt(
+    raw_spect = np.abs(librosa.cqt(
         song_vals, sr=sr, hop_length=hop_length,
-        n_bins=8*bins_per_note*12, bins_per_octave=bins_per_note*12,
-    ))
-    db_spect = librosa.amplitude_to_db(spect)  # (freq, time)
-    db_spect = (db_spect - db_spect.mean()) / db_spect.std()
-    # variables
-    n_freq, n_full_time = db_spect.shape
-    n_time = int(batch_seconds * sr / hop_length)
-    n_batch = ceil(n_full_time / n_time)
+        n_bins=n_octaves*bins_per_note*12, bins_per_octave=bins_per_note*12,
+    )).T
+    spect = librosa.amplitude_to_db(raw_spect)  # (full_time, freq)
+    spect: np.ndarray = (spect - spect.mean()) / spect.std()
+    n_full_time, n_freq = spect.shape
+    n_second = sr // hop_length
     # split into batches
-    flat_spect = np.zeros((n_freq, n_batch * n_time))
-    flat_spect[:, :n_full_time] = db_spect
-    batched_spect = flat_spect.reshape((n_freq, n_batch, n_time))
-    batched_spect = np.transpose(batched_spect, (1, 2, 0))  # (t_batch, time, freq)
-    return batched_spect
+    n_time = optimal_batch_size(n_full_time, batch_seconds * n_second, multiple=n_second)
+    n_batch = n_full_time // n_time
+    residue = n_full_time % n_time  # n of frames to cut from the ends
+    clean_spect = spect[(residue+1)//2: n_full_time-residue//2]  # (n_batch*n_time, freq)
+    return clean_spect.reshape(n_batch, n_time, n_freq)
 
 
-def load_labels(song: str, split: str, all_notes: bool) -> pd.DataFrame:
+def load_labels(song: str, split: Literal["train", "test"], all_notes: bool) -> pd.DataFrame:
     """Load labels of a song. Time is in sample space"""
-    assert split in ["train", "test"], "Invalid split"
     song_path = f"{dataset_path}\\{split}_labels\\{song}.csv"
 
     with open(song_path, "r") as f:
@@ -69,38 +93,37 @@ def load_labels(song: str, split: str, all_notes: bool) -> pd.DataFrame:
 
 def one_hot_labels(
     raw_labels: pd.DataFrame,
-    num_samples: int,
-    batch_seconds: float,
-    sr: int,
+    n_batch: int,
+    n_time: int,
     hop_length: int,
     all_notes: bool,
 ) -> np.ndarray:
     """
     Returns a boolean array determining if a given window of the stft contains
     a note or not. Index t is the window centered at sample time t * hop_length
-    num_samples: length of the signal of the corresponding label
-    out: shape (*time, n_notes)
+
+    Args:
+        raw_labels: dataframe with (start, end, note) tuples
+        n_batch: number of batches
+        n_time: length of each batch
     """
-    n_time = ceil(num_samples / hop_length)
-    new_n_time = int(batch_seconds * sr / hop_length)
-    n_batch = ceil(n_time / new_n_time)
-    n_notes = 12 * 8 if all_notes else 12
-    labels = np.full((n_batch * new_n_time, n_notes), False, dtype=bool)
+    n_notes = 12 * n_octaves if all_notes else 12
+    labels = np.full((n_batch * n_time, n_notes), False, dtype=bool)
     for _, row in raw_labels.iterrows():
         start, end, note = row
-        note = note - 12 if all_notes else note
-        if note < 0 or note >= n_notes:  # using C1 to B8
+        note = note - 12 if all_notes else note  # NOTE: depends on n_octaves
+        if note < 0 or note >= n_notes:
             continue
         lower = round(start / hop_length)
         upper = round(end / hop_length)
         labels[lower:upper, note] = True
-    return labels.reshape(n_batch, new_n_time, n_notes)
+    return labels.reshape(n_batch, n_time, n_notes)
 
 
 def process_song(
     song: str,
-    split: str,
-    batch_seconds: float,
+    split: Literal["train", "test"],
+    batch_seconds: int,
     bins_per_note: int,
     sr: int,
     hop_length: int,
@@ -117,30 +140,30 @@ def process_song(
     song_vals = load_song(song, split)
     spect = batched_q_transform(
         song_vals, batch_seconds, bins_per_note, sr, hop_length
-    ).astype(np.float32)
+    ).astype(np.float16)
 
     raw_labels = load_labels(song, split, all_notes)
     labels = one_hot_labels(
-        raw_labels, song_vals.shape[0], batch_seconds, sr, hop_length, all_notes,
+        raw_labels, spect.shape[0], spect.shape[1], hop_length, all_notes,
     ).astype(bool)
 
-    np.save(f"{save_path}\\{split}_data\\{song}.npy", spect)
-    np.save(f"{save_path}\\{split}_labels\\{song}.npy", labels)
+    for idx, (batch_spect, batch_label) in enumerate(zip(spect, labels)):
+        np.save(f"{save_path}\\{split}_data\\{song}_{idx}.npy", batch_spect)
+        np.save(f"{save_path}\\{split}_labels\\{song}_{idx}.npy", batch_label)
 
 
-def process_data(split: str, **args) -> None:
+def process_data(split: Literal["train", "test"], num_workers: int = 8, **args) -> None:
     """
     Load and process all songs in parallel.
     args: arguments for process_song
     """
-    assert split in ["train", "test"], "Invalid split"
     for info in ["data", "labels"]:
         try:
             os.mkdir(f"{save_path}\\{split}_{info}")
         except FileExistsError:
             pass
 
-    executor = futures.ProcessPoolExecutor(max_workers=8)
+    executor = futures.ProcessPoolExecutor(max_workers=num_workers or 8)
     process_futures = []
     print(f"Loading and processing {split}ing data and labels...")
     for f in os.listdir(os.fsencode(f"{dataset_path}\\{split}_data")):
@@ -160,8 +183,9 @@ def process_data(split: str, **args) -> None:
 
 if __name__ == "__main__":
     process_data(
-        split="test",
-        batch_seconds=4,
+        split="train",
+        num_workers=8,
+        batch_seconds=60,
         bins_per_note=4,
         sr=22050,
         hop_length=512,
