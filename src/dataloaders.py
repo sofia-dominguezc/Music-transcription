@@ -7,6 +7,8 @@ from typing import Literal
 
 from preprocess_data import save_path
 
+max_time = 90 * (22050 // 512)  # max length of batch is 90s
+
 
 class GroupedTensorDataset(Dataset[tuple[Tensor, Tensor]]):
     """Stores a list of numpy arrays with mmap_mode=r"""
@@ -40,9 +42,9 @@ class GroupedTensorDataset(Dataset[tuple[Tensor, Tensor]]):
         return x_tensor, y_tensor
 
 
-class LazyTensorDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
+class LazyTensorDataset(Dataset[tuple[Tensor, ...]]):
     """Stores a list of files (e.g. ["1727", "1728"]) and loads in __getitem__"""
-    max_time = 90 * (22050 // 512)  # max batch size is 90s
+    second = 22050 // 512  # n frames in a second
 
     def __init__(
         self,
@@ -57,7 +59,7 @@ class LazyTensorDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
     def __len__(self) -> int:
         return len(self.files)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor]:
+    def __getitem__(self, index: int) -> tuple[Tensor, ...]:
         """
         Returns:
             x_padded: (max_time, freq)
@@ -66,22 +68,28 @@ class LazyTensorDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
         """
         x_file = f"{self.root}\\{self.split}_data\\{self.files[index]}.npy"
         x_array = np.load(x_file)
-        x_tensor = torch.from_numpy(x_array).to(torch.float32)
+        x_tensor = torch.from_numpy(x_array).to(torch.float32)  # (time, freq)
 
         y_file = f"{self.root}\\{self.split}_labels\\{self.files[index]}.npy"
         y_array = np.load(y_file)
-        y_tensor = torch.from_numpy(y_array).to(torch.float64)
+        y_tensor = torch.from_numpy(y_array).to(torch.float64)  # (time, notes)
 
-        seq_len = x_tensor.shape[0]
-        pad_len = self.max_time - seq_len
-        assert pad_len >= 0, "Sequence length larger than max_time"
+        return (
+            x_tensor.unflatten(0, (-1, self.second)),  # (batch, second, freq)
+            y_tensor.unflatten(0, (-1, self.second)),  # (batch, second, notes)
+        )
 
-        x_padded = nn.functional.pad(x_tensor, (0, 0, 0, pad_len), value=0)
-        y_padded = nn.functional.pad(y_tensor, (0, 0, 0, pad_len), value=0)
-        mask = torch.zeros(self.max_time, dtype=torch.bool)
-        mask[seq_len:] = True
 
-        return x_padded, mask, y_padded
+def collate_samples(batches: list[tuple[Tensor, ...]]) -> tuple[Tensor, ...]:
+    """
+    Concatenate tensors along the first dimension
+    batches: [(x1, y1, ...), (x2, y2, ...), ...]
+    output: (X, Y, ...)
+    """
+    output = []
+    for x in zip(*batches):
+        output.append(torch.cat(x, dim=0))
+    return tuple(output)
 
 
 def create_dataloader(
@@ -139,8 +147,13 @@ def create_lazy_dataloader(
         "num_workers": num_workers,
         "pin_memory": True,
         "persistent_workers": True,
+        "prefetch_factor": 12,
     } if num_workers > 0 else {}
     dataloader = DataLoader(
-        dataset, batch_size, shuffle=(split=="train"), **workers_args,
+        dataset,
+        batch_size,
+        shuffle=(split=="train"),
+        collate_fn=collate_samples,
+        **workers_args,
     )
     return dataloader

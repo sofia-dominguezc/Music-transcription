@@ -1,10 +1,12 @@
 import os
-import pandas as pd
-import numpy as np
-import librosa
+from math import ceil
 from concurrent import futures
 from tqdm import tqdm
 from typing import Literal
+
+import numpy as np
+import pandas as pd
+import librosa
 
 dataset_path = "data\\musicnet"
 save_path = "data\\musicnet_processed"
@@ -21,34 +23,6 @@ def load_song(song: str, split: Literal["train", "test"]) -> np.ndarray:
     return song_vals
 
 
-def optimal_batch_size(
-    total_length: int,
-    ideal_batch: int,
-    multiple: int = 1,
-    lower_mult: float = 0.66,
-    upper_mult: float = 1.5,
-) -> int:
-    """
-    Find batch size close to ideal_batch that would result in cropping
-    the least possible from the ends of a series of length total_length
-
-    Args:
-        total_length: length of sequence to partition
-        ideal_batch: ideal batch size to use
-        multiple: condition possible batch sizes to be a multiple of this
-        lower_mult: minimum multiplier of ideal_batch to consider
-        upper_mult: maximum multiplier of ideal_batch to consider
-    """
-    options = [
-        multiple * small_opt for small_opt in range(
-            int(lower_mult * ideal_batch / multiple), int(upper_mult * ideal_batch / multiple)
-        )
-    ]
-    min_res = min(total_length % opt for opt in options)
-    optimal_options = [opt for opt in options if total_length % opt == min_res]
-    return min((abs(opt - ideal_batch), opt) for opt in optimal_options)[1]
-
-
 def batched_q_transform(
     song_vals: np.ndarray,
     batch_seconds: int,
@@ -62,19 +36,22 @@ def batched_q_transform(
     """
     # spectogram
     raw_spect = np.abs(librosa.cqt(
-        song_vals, sr=sr, hop_length=hop_length,
-        n_bins=n_octaves*bins_per_note*12, bins_per_octave=bins_per_note*12,
+        song_vals,
+        sr=sr,
+        hop_length=hop_length,
+        n_bins=n_octaves*bins_per_note*12,
+        bins_per_octave=bins_per_note*12,
+        filter_scale=0.4,
     )).T
     spect = librosa.amplitude_to_db(raw_spect)  # (full_time, freq)
     spect: np.ndarray = (spect - spect.mean()) / spect.std()
-    n_full_time, n_freq = spect.shape
-    n_second = sr // hop_length
     # split into batches
-    n_time = optimal_batch_size(n_full_time, batch_seconds * n_second, multiple=n_second)
-    n_batch = n_full_time // n_time
-    residue = n_full_time % n_time  # n of frames to cut from the ends
-    clean_spect = spect[(residue+1)//2: n_full_time-residue//2]  # (n_batch*n_time, freq)
-    return clean_spect.reshape(n_batch, n_time, n_freq)
+    n_full_time, n_freq = spect.shape
+    n_time = batch_seconds * (sr // hop_length)
+    n_batch = ceil(n_full_time / n_time)
+    full_spect = np.zeros((n_batch * n_time, n_freq))
+    full_spect[:n_full_time] = spect
+    return full_spect.reshape((n_batch, n_time, n_freq))
 
 
 def load_labels(song: str, split: Literal["train", "test"], all_notes: bool) -> pd.DataFrame:
@@ -111,7 +88,7 @@ def one_hot_labels(
     labels = np.full((n_batch * n_time, n_notes), False, dtype=bool)
     for _, row in raw_labels.iterrows():
         start, end, note = row
-        note = note - 12 if all_notes else note  # NOTE: depends on n_octaves
+        note = note - 24 if all_notes else note  # NOTE: depends on n_octaves
         if note < 0 or note >= n_notes:
             continue
         lower = round(start / hop_length)
@@ -138,12 +115,12 @@ def process_song(
     only_note_name: if true, then considers notes modulo 12
     """
     song_vals = load_song(song, split)
-    spect = batched_q_transform(
+    spect = batched_q_transform(  # (batch, time, freq)
         song_vals, batch_seconds, bins_per_note, sr, hop_length
     ).astype(np.float16)
 
     raw_labels = load_labels(song, split, all_notes)
-    labels = one_hot_labels(
+    labels = one_hot_labels(  # (batch, time, notes)
         raw_labels, spect.shape[0], spect.shape[1], hop_length, all_notes,
     ).astype(bool)
 
