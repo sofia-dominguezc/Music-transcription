@@ -41,18 +41,17 @@ def batched_q_transform(
         hop_length=hop_length,
         n_bins=n_octaves*bins_per_note*12,
         bins_per_octave=bins_per_note*12,
-        filter_scale=0.5,
+        filter_scale=0.4,
     )).T
     spect = librosa.amplitude_to_db(raw_spect)  # (full_time, freq)
     spect: np.ndarray = (spect - spect.mean()) / spect.std()
+    # split into batches
     n_full_time, n_freq = spect.shape
     n_time = batch_seconds * (sr // hop_length)
     n_batch = ceil(n_full_time / n_time)
-    # split into batches
-    flat_spect = np.zeros((n_batch * n_time, n_freq))
-    flat_spect[:n_full_time] = spect
-    batched_spect = flat_spect.reshape((n_batch, n_time, n_freq))
-    return batched_spect
+    full_spect = np.zeros((n_batch * n_time, n_freq))
+    full_spect[:n_full_time] = spect
+    return full_spect.reshape((n_batch, n_time, n_freq))
 
 
 def load_labels(song: str, split: Literal["train", "test"], all_notes: bool) -> pd.DataFrame:

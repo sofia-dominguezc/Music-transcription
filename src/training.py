@@ -6,7 +6,7 @@ from torch import nn, optim, Tensor
 from torch.utils.data import DataLoader
 import lightning as pl
 
-from dataloaders import max_time
+second = 22050 // 512
 
 
 model_weights = "parameters\\model_weights.pth"
@@ -17,7 +17,7 @@ def positional_encoding(seq: int, dim: int):
     """Sinusoidal positional encoding of shape (seq, dim)"""
     pe = torch.zeros(seq, dim)
     position = torch.arange(0, seq).unsqueeze(1)  # (seq, 1)
-    div_term = torch.exp(torch.arange(0, dim, 2) * (-log(10000) / dim))
+    div_term = torch.exp(torch.arange(0, dim, 2) * (-log(100) / dim))
     pe[:, 0::2] = torch.sin(position * div_term)
     pe[:, 1::2] = torch.cos(position * div_term)
     return pe
@@ -122,12 +122,11 @@ class MusicTransformer(nn.Module):
         n_heads: int = 4,
         head_dim: int = 32,
         c: int = 3,
+        embed_dim: int = 128,
     ):
         super().__init__()
-        self.second = 22050 // 512  # number of frames in a second
         freq = 12 * 8 * 4  # input frequency dimension
         output_dim = 12 * 8  # 96
-        embed_dim = 128
 
         self.tokenizer = nn.Sequential(  # (batch, freq) -> (batch, embed_dim)
             nn.Unflatten(-1, (1, -1)),
@@ -138,7 +137,7 @@ class MusicTransformer(nn.Module):
             nn.Flatten(-2),
             nn.Linear(c**2 * ((freq+3)//4), embed_dim),
         )
-        self.pos_enc = nn.Buffer(positional_encoding(max_time, embed_dim), persistent=False)
+        self.pos_enc = nn.Buffer(positional_encoding(second, embed_dim), persistent=False)
         # self.pos_enc = nn.Conv1d(  # (batch, embed_dim, time)
         #     embed_dim,
         #     embed_dim,
@@ -169,14 +168,14 @@ class MusicTransformer(nn.Module):
 
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         """
-        x: (batch, time, freq)
+        x: (batch, second, freq)
         mask: (batch, second)
         Self-attention over time with CNN as positional encoding
         """
-        batch, time, freq = x.shape
-        x = self.tokenizer(x.flatten(0, 1)).unflatten(0, (batch, time))  # (batch, time, embed_dim)
+        batch = x.shape[0]
+        x = self.tokenizer(x.flatten(0, 1)).unflatten(0, (batch, -1))  # (batch, time, embed_dim)
         # x = x + self.pos_enc(x.transpose(-2, -1)).transpose(-2, -1)
-        x = x + self.pos_enc[None, :time, :]
+        x = x + self.pos_enc[None, :, :]
 
         for attn, mlp, ln in zip(self.attn, self.mlp, self.layer_norm):
             x = ln(x)
@@ -303,7 +302,7 @@ def train(
     params_root: str = ".",
 ) -> None:
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=10*lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, total_epochs)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, total_epochs, eta_min=0.01*lr)
     plmodel = LitMusicModel(model, optimizer, scheduler, params_root=params_root)
     trainer = pl.Trainer(max_epochs=total_epochs, logger=False, enable_checkpointing=False)
     trainer.fit(plmodel, train_loader, val_loader)
@@ -341,7 +340,7 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')
     from dataloaders import create_lazy_dataloader
 
-    model = MusicTransformer(n_layers=4, n_heads=4, head_dim=24, c=2)
+    model = MusicTransformer(n_layers=4, n_heads=4, head_dim=32, c=3, embed_dim=192)
     # model.load_state_dict(torch.load("parameters\\model_weights.pth"))
     train_loader = create_lazy_dataloader(split="train", batch_size=8, num_workers=8)
     val_loader = create_lazy_dataloader(split="test", batch_size=1, num_workers=0)
@@ -349,8 +348,8 @@ if __name__ == "__main__":
     train(
         model,
         train_loader,
-        lr=1e-3,
-        total_epochs=30,
+        lr=5e-4,
+        total_epochs=40,
         val_loader=val_loader,
     )
 
@@ -361,31 +360,18 @@ if __name__ == "__main__":
     )
 
     # TODO: batch by second before doing self-attention so it doesn't take this long
-    # TODO: check that labels and songs are aligned, it seems they're not
 
 
 # Experiments:
 
 # Multiple convolution layers or with very large kernels doesn't work very well
 
-# I got basically the best performance from a single (5, 9) convolution
-#   by adding more channels and residual connection.
-# I used 12 features in 0.3s along 2 notes. lr=0.004 and gamma=0.4 every epoch
-
 # I also noticed that repeating the linear layer per channel doesn't loose much
 #   performance, if after that we use a max over channels and residual connection
 
 # I also noticed that the maxpool is not too important in convolutional layers
 
-# The 3d convolution helps a lot for its size, but it's painfully slow
-
 # The temporal part of the convolution doesn't seem to help as much
-
-
-# POSSIBLE IMPROVEMENTS
-
-# make the frequency window larger
-# add the normal interpolated spectogram since features at high frequencies are bad
 
 
 # 3 IMPORANT FINDINGS
@@ -396,4 +382,8 @@ if __name__ == "__main__":
 
 # lr=0.04 is perfect for 1 epoch
 
-# maybe it's a bug, but it seems that a vision transformer is just awful
+
+# Normal transformer
+
+# using n_layers=4, n_heads=4, head_dim=32, c=3, embed_dim=192:
+# best lr: 5e-4, test acc = 40%, it overfits at 22/40 epochs (when losses are about 3.6)
