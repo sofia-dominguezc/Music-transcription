@@ -44,8 +44,6 @@ class GroupedTensorDataset(Dataset[tuple[Tensor, Tensor]]):
 
 class LazyTensorDataset(Dataset[tuple[Tensor, ...]]):
     """Stores a list of files (e.g. ["1727", "1728"]) and loads in __getitem__"""
-    second = 22050 // 512  # n frames in a second
-
     def __init__(
         self,
         files: list[str],
@@ -62,23 +60,18 @@ class LazyTensorDataset(Dataset[tuple[Tensor, ...]]):
     def __getitem__(self, index: int) -> tuple[Tensor, ...]:
         """
         Returns:
-            x_padded: (max_time, freq)
-            mask: (max_time, )
-            y_padded: (max_time, notes)
+            x_tensor: (batch, time, notes)
+            y_tensor: (batch, time, notes)
         """
         x_file = f"{self.root}\\{self.split}_data\\{self.files[index]}.npy"
         x_array = np.load(x_file)
-        x_tensor = torch.from_numpy(x_array).to(torch.float32)  # (time, freq)
+        x_tensor = torch.from_numpy(x_array).to(torch.float32)
 
         y_file = f"{self.root}\\{self.split}_labels\\{self.files[index]}.npy"
         y_array = np.load(y_file)
-        y_tensor = torch.from_numpy(y_array).to(torch.float64)  # (time, notes)
+        y_tensor = torch.from_numpy(y_array).to(torch.float64)
 
-        return (
-            x_tensor.unflatten(0, (-1, self.second)),  # (batch, second, freq)
-            y_tensor.unflatten(0, (-1, self.second)),  # (batch, second, notes)
-        )
-
+        return x_tensor, y_tensor
 
 def collate_samples(batches: list[tuple[Tensor, ...]]) -> tuple[Tensor, ...]:
     """

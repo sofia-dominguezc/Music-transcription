@@ -12,7 +12,7 @@ dataset_path = "data\\musicnet"
 save_path = "data\\musicnet_processed"
 n_octaves = 8
 
-# NOTE: songs are asssumed to have sr=22050 and labels are in 44100
+# NOTE: songs have sr=22050 and labels are in 44100
 
 
 def load_song(song: str, split: Literal["train", "test"]) -> np.ndarray:
@@ -41,7 +41,7 @@ def batched_q_transform(
         hop_length=hop_length,
         n_bins=n_octaves*bins_per_note*12,
         bins_per_octave=bins_per_note*12,
-        filter_scale=0.4,
+        filter_scale=0.5,
     )).T
     spect = librosa.amplitude_to_db(raw_spect)  # (full_time, freq)
     spect: np.ndarray = (spect - spect.mean()) / spect.std()
@@ -62,7 +62,7 @@ def load_labels(song: str, split: Literal["train", "test"], all_notes: bool) -> 
         df = pd.read_csv(f)
     df = df.rename(columns={"start_time": "start", "end_time": "end"})
 
-    df[["start", "end"]] /= 2  # adjust to real sr
+    df[["start", "end"]] /= 2  # NOTE: adjust to real sr
     if not all_notes:
         df["note"] = df["note"] % 12
     return df[["start", "end", "note"]].astype(int)
@@ -105,14 +105,21 @@ def process_song(
     sr: int,
     hop_length: int,
     all_notes: bool,
+    n_batches: int = 60,
 ) -> None:
     """
     Loads song, calculates the batched spectogram, puts the labels in
     one hot format, and saves everything to .npy files.
-    hop_length: number of samples between consecutive windows for stft
-    n_freq: size of frequency dimension. Interpolates between available ones
-    time_repeat: number of time indices to repeat per batch on each direction
-    only_note_name: if true, then considers notes modulo 12
+
+    Args:
+        song: name of file
+        split: name of data split
+        batch_seconds: number of seconds on each batch (default 1)
+        bins_per_note: number of frequency samples between notes
+        sr: sapmling rate
+        hop_length: distance between applications of q-transform
+        all_notes: if fase, considers notese modulo 12
+        n_batches: number of batches (of size batch_seconds) to save on each file
     """
     song_vals = load_song(song, split)
     spect = batched_q_transform(  # (batch, time, freq)
@@ -124,9 +131,10 @@ def process_song(
         raw_labels, spect.shape[0], spect.shape[1], hop_length, all_notes,
     ).astype(bool)
 
-    for idx, (batch_spect, batch_label) in enumerate(zip(spect, labels)):
-        np.save(f"{save_path}\\{split}_data\\{song}_{idx}.npy", batch_spect)
-        np.save(f"{save_path}\\{split}_labels\\{song}_{idx}.npy", batch_label)
+    for idx in range(0, spect.shape[0], n_batches):
+        i = idx // n_batches
+        np.save(f"{save_path}\\{split}_data\\{song}_{i}.npy", spect[idx: idx + n_batches])
+        np.save(f"{save_path}\\{split}_labels\\{song}_{i}.npy", labels[idx: idx + n_batches])
 
 
 def process_data(split: Literal["train", "test"], num_workers: int = 8, **args) -> None:
@@ -138,6 +146,10 @@ def process_data(split: Literal["train", "test"], num_workers: int = 8, **args) 
         try:
             os.mkdir(f"{save_path}\\{split}_{info}")
         except FileExistsError:
+            print(
+                f"Note: {split}_{info} directory already exists. "
+                "Old files will not be deleted."
+            )
             pass
 
     executor = futures.ProcessPoolExecutor(max_workers=num_workers or 8)
@@ -160,11 +172,12 @@ def process_data(split: Literal["train", "test"], num_workers: int = 8, **args) 
 
 if __name__ == "__main__":
     process_data(
-        split="train",
+        split="test",
         num_workers=8,
-        batch_seconds=60,
+        batch_seconds=1,
         bins_per_note=4,
         sr=22050,
         hop_length=512,
         all_notes=True,
+        n_batches=60,
     )
