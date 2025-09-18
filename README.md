@@ -1,66 +1,105 @@
-The goal is to train an AI that can recognize which notes are being played, but the inputs to the model will be the spectogram instead of the raw sound.
+# Music transcription
 
-paper: https://projects.iq.harvard.edu/files/kakade/files/1611-09827-2017.pdf
+Model to predict musical pitch from a song's audio implemented in pytorch.
+
+I built this as a personal project to solve a non-trivial machine learning task that requires larger amounts of data.
+
+Inspiration/baseline: <a href="https://projects.iq.harvard.edu/files/kakade/files/1611-09827-2017.pdf">Learning Features of Music from Scratch</a>
+
+## Methodology
+
+The processing pipeline begins by applying the <a href="https://en.wikipedia.org/wiki/Constant-Q_transform">Constant-Q transform</a> to the raw audio signal. This produces a spectrogram representation that behaves more uniformly across different pitch ranges, making it better suited for musical analysis.
+
+The resulting spectrogram is divided into short one-second segments, which are then grouped together into one-minute batches. Each of these short segments is first passed through a shallow convolutional encoder that extracts a compact representation of the frequency patterns.
+
+These encoded sequences are then processed with a transformer model applied along the time dimension to extract long-range temporal information. Finally, a small feed-forward network maps the transformer’s output to note predictions over time.
+
+TODO: add image of this process
+
+For training we use binary cross-entropy loss, and for accuracy we count the number of time-steps where the model correctly predicted every single note.
 
 ## Usage
 
-`python src`
+The project can be run in two modes: data preprocessing and model training/testing. Both are handled through subcommands of the main script.
 
-## Arguments
+### Preprocessing
 
-- `--action`, `-a`. Options: `train`, `train-val`, `test`, `process-train`, `process-test`. **Required.**
-- `--lr`: Learning rate for training.
-- `--num-epochs`: Number of training epochs.
-- `--batch-size`: Number of samples per training batch.
-- `--num-workers`: Number of worker processes for data loading.
-- `--gamma`: Learning rate scheduler multiplier.
-- `--milestones`: Epochs at which to adjust the learning rate.
+To preprocess raw audio into spectrogram chunks:
 
-- `--thresholds`: Probability thresholds for test accuracy calculation. Must be in [0, 1].
-- `--allowed-errors`: Allowed errors per frame for test performance.
+```python src preprocess```
 
-- `--c`: Multiplier for the number of convolutional channels.
-- `--test-dev`: If set, runs test loop using dev model.
+Default options:
 
-- `--batch-seconds`: Duration (in seconds) of each batch.
-- `--bins-per-octave`: Number of frequency bins per octave.
-- `--only-note-names`: If set, processes notes modulo 12.
-- `--sr`: Audio sample rate.
-- `--hop-length`: Step size between FFT windows.
+`--split train` - dataset split to process (train or test)
+
+`--num-workers 8` - number of workers for preprocessing
+
+`--batch-seconds 1` - length (in seconds) of each chunk
+
+`--bins-per-note 4` - frequency bins per note
+
+`--sr 22050` - sample rate
+
+`--hop-length 512` - hop length for the transform
+
+`--all-notes` - if provided, use full note range (otherwise notes modulo 12)
+
+`--n-batches 60` - number of batches to save per file
+
+### Training and Testing
+
+To train a transformer model and evaluate it:
+
+```python -m your_module train```
+
+Default options:
+
+`--batch-size 8` - batch size for training
+
+`--num-workers 8` - dataloader workers
+
+`--lr 5e-4` - learning rate
+
+`--epochs 25` - number of training epochs
+
+`--allowed-errors 0 1 2` - list of tolerances for evaluation metrics
+
+`--n-layers 4` - number of transformer layers
+
+`--n-heads 4` - number of attention heads
+
+`--head-dim 32` - dimension of each attention head
+
+`--c 3` - convolutional channel multiplier
+
+`--embed-dim 192` - embedding dimension
+
+`--load-weights` - path to a checkpoint file to resume from
+
+## Current architecture
+
+CNN encoding + Transformer + MLP decoder: `n_layers=4`, `n_heads=4`, `head_dim=32`, `c=3`, `embed_dim=192` (1.8M params).
+- Best learning rate found: `lr=5e-4`, `test_acc = 30%` (`43%` for note names)
+- Validation stopped improving at `loss=3.9`, `acc=30%`, while training loss reached `loss=3.7`
+
+## Experiment results
+
+- Frequency convolutions larger than 1.5 notes result in lower accuracy
+
+- Maxpool in the encoding CNN doesn't significantly affect performance
+
+- Even a single fully connected layer in the frequency dimension significantly improves accuracy
+
+- Temporal convolutions or temporal fully connected layers don't significantly improve performance
+
+- Self-attention over a short time range (1s) improves accuracy from 25% (CNN + MLP) to 30% (CNN + Transformer + MLP)
+
+- Fixed sinusoidal positional encoding performs equally well as a 1d temporal convolution
 
 ## TODO
 
-- Make the system that processes a song and outputs the notes in real time.
-- Make `__main__` so it supports pre-processing, training, and evaluation
-- Consider adding a long range attention. Code for criss-cross transformers and masking are in the repo's history
-- Consider training the model from raw labels instead of q-transform
-- Add support for `all_notes=False`
+- Explore long-range temporal attention (accross 1min instead of 1s) and test if it improves accuracy.
 
-## Experiments:
+- Try training a larger model to see if the test accuracy plateau is a consequence of model expresivity or of data.
 
-### Older
-
-Multiple convolution layers or with very large kernels doesn't work very well
-
-I also noticed that repeating the linear layer per channel doesn't loose much
-  performance, if after that we use a max over channels and residual connection
-
-I also noticed that the maxpool is not too important in convolutional layers
-
-The temporal part of the convolution doesn't seem to help as much
-
-### 4 important findings
-
-- linear layers or long-range convolutions w.r.t. time are useless, but small ones help a bit
-
-- convolutions w.r.t. frequency must include at most 1.5 notes above/below
-
-- sinusoidal positional encoding performs the same as a 1d convolution
-
-- self-attention over short time range (1s) improves accuracy from 25% (CNN + MLP) to 30% (current architecture)
-
-### Short range transformer
-
-Using n_layers=4, n_heads=4, head_dim=32, c=3, embed_dim=192 (1.8M params):
-  best lr: 5e-4, test_acc = 30% (43% in notes)
-  validation stopped improving at loss=3.9, acc=30% while train_loss made it to loss=3.7
+- Try different pre-processing techniques besides STFT and Constant-Q transform to see if this is why the model still has low accuracy.
