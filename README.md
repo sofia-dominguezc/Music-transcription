@@ -2,13 +2,13 @@
 
 Model to predict musical pitch from a song's audio implemented in pytorch.
 
-I built this as a personal project to solve a non-trivial machine learning task that requires larger amounts of data.
+I built this as a personal project to solve an interesting machine learning task that requires large amounts of data.
 
 Inspiration/baseline: <a href="https://projects.iq.harvard.edu/files/kakade/files/1611-09827-2017.pdf">Learning Features of Music from Scratch</a>
 
 ## Methodology
 
-The processing pipeline begins by applying the <a href="https://en.wikipedia.org/wiki/Constant-Q_transform">Constant-Q transform</a> to the raw audio signal. This produces a spectrogram representation that behaves more uniformly across different pitch ranges, making it better suited for musical analysis.
+Pre-processing consists of applying the <a href="https://en.wikipedia.org/wiki/Constant-Q_transform">Constant-Q transform</a> to the raw audio signal. This produces a spectrogram representation that behaves more uniformly across different pitch ranges, making it better suited for musical analysis.
 
 The resulting spectrogram is divided into short one-second segments. Each of these segments is first passed through a shallow convolutional encoder that extracts a compact representation of the frequency patterns, and these encoded sequences are then processed with a transformer model applied along the time dimension to extract temporal information. Finally, a small feed-forward network maps the model's output to note predictions over time.
 
@@ -19,6 +19,10 @@ The resulting spectrogram is divided into short one-second segments. Each of the
 </div>
 
 For training, I used the <a href="https://zenodo.org/records/5120004">Musicnet dataset</a>, a collection of ~300 freely-licensed classical recordings annotated by experts. The training objective is binary cross-entropy loss, and the accuracy is the fraction of time-steps where the model correctly predicted every single note.
+
+I implemented a "lazy dataloader" that only reads a batch from disk when it's being used because the dataset is too big to fit into VRAM when using multiple workers. This allows optimal GPU utilization which decreases training time.
+
+All models were trained using an NVIDIA RTX 4070.
 
 ## Usage
 
