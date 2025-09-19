@@ -13,9 +13,9 @@ The processing pipeline begins by applying the <a href="https://en.wikipedia.org
 The resulting spectrogram is divided into short one-second segments. Each of these segments is first passed through a shallow convolutional encoder that extracts a compact representation of the frequency patterns, and these encoded sequences are then processed with a transformer model applied along the time dimension to extract temporal information. Finally, a small feed-forward network maps the model's output to note predictions over time.
 
 <div align="center">
-  <img src="images/Processing-Flow.png" width="800" height="480" alt="Processing-Flow"/>
+  <img src="images/Processing-Flow.png" width="800" height="800" alt="Processing-Flow"/>
   <figcaption><em>Figure 1. Illustration of classification process.</em></figcaption>
-  <br>
+  <br><br>
 </div>
 
 For training, I used the <a href="https://zenodo.org/records/5120004">Musicnet dataset</a>, a collection of ~300 freely-licensed classical recordings annotated by experts. The training objective is binary cross-entropy loss, and the accuracy is the fraction of time-steps where the model correctly predicted every single note.
