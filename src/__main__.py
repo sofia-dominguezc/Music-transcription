@@ -1,11 +1,8 @@
 import argparse
-from training import train, test, MusicTransformer
-from preprocess_data import process_data
-from dataloaders import create_lazy_dataloader
-import torch
 
 
-def run_process(args):
+def run_preprocess(args):
+    from preprocess_data import process_data
     process_data(
         split=args.split,
         num_workers=args.num_workers,
@@ -13,12 +10,15 @@ def run_process(args):
         bins_per_note=args.bins_per_note,
         sr=args.sr,
         hop_length=args.hop_length,
-        all_notes=args.all_notes,
+        all_notes=~args.only_note_names,
         n_batches=args.n_batches,
     )
 
 
 def run_train(args):
+    from training import train, test, MusicTransformer, load
+    from dataloaders import create_lazy_dataloader
+
     model = MusicTransformer(
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -27,8 +27,10 @@ def run_train(args):
         embed_dim=args.embed_dim,
     )
 
-    if args.load_weights:
-        model.load_state_dict(torch.load(args.load_weights))
+    if args.load_weights == "main":
+        load(model, dev=False)
+    elif args.load_weights == "dev":
+        load(model, dev=True)
 
     train_loader = create_lazy_dataloader(
         split="train", batch_size=args.batch_size, num_workers=args.num_workers
@@ -59,14 +61,14 @@ def parse_args():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # --- Preprocessing ---
-    process_parser = subparsers.add_parser("process", help="Preprocess data")
+    process_parser = subparsers.add_parser("preprocess", help="Preprocess data")
     process_parser.add_argument("--split", type=str, default="test")
     process_parser.add_argument("--num-workers", type=int, default=8)
     process_parser.add_argument("--batch-seconds", type=float, default=1)
     process_parser.add_argument("--bins-per-note", type=int, default=4)
     process_parser.add_argument("--sr", type=int, default=22050)
     process_parser.add_argument("--hop-length", type=int, default=512)
-    process_parser.add_argument("--all-notes", action="store_true")
+    process_parser.add_argument("--only-note-names", action="store_true")
     process_parser.add_argument("--n-batches", type=int, default=60)
 
     # --- Training ---
@@ -76,7 +78,7 @@ def parse_args():
     train_parser.add_argument("--head-dim", type=int, default=32)
     train_parser.add_argument("--c", type=int, default=3)
     train_parser.add_argument("--embed-dim", type=int, default=192)
-    train_parser.add_argument("--load-weights", type=str, default=None)
+    train_parser.add_argument("--load-weights", options=["main", "dev"], default=None)
 
     train_parser.add_argument("--batch-size", type=int, default=8)
     train_parser.add_argument("--num-workers", type=int, default=8)
@@ -91,7 +93,7 @@ def main():
     args = parse_args()
 
     if args.command == "preprocess":
-        run_process(args)
+        run_preprocess(args)
     elif args.command == "train":
         run_train(args)
     else:

@@ -144,11 +144,12 @@ def process_data(split: Literal["train", "test"], num_workers: int = 8, **args) 
     """
     for info in ["data", "labels"]:
         try:
+            os.makedirs(f"{save_path}", exist_ok=True)
             os.mkdir(f"{save_path}\\{split}_{info}")
         except FileExistsError:
             print(
                 f"Note: {split}_{info} directory already exists. "
-                "Old files will not be deleted."
+                "Old files may remain there."
             )
             pass
 
@@ -172,7 +173,7 @@ def process_data(split: Literal["train", "test"], num_workers: int = 8, **args) 
 
 if __name__ == "__main__":
     process_data(
-        split="test",
+        split="train",
         num_workers=8,
         batch_seconds=1,
         bins_per_note=4,

@@ -10,13 +10,15 @@ Inspiration/baseline: <a href="https://projects.iq.harvard.edu/files/kakade/file
 
 The processing pipeline begins by applying the <a href="https://en.wikipedia.org/wiki/Constant-Q_transform">Constant-Q transform</a> to the raw audio signal. This produces a spectrogram representation that behaves more uniformly across different pitch ranges, making it better suited for musical analysis.
 
-The resulting spectrogram is divided into short one-second segments, which are then grouped together into one-minute batches. Each of these short segments is first passed through a shallow convolutional encoder that extracts a compact representation of the frequency patterns.
+The resulting spectrogram is divided into short one-second segments. Each of these segments is first passed through a shallow convolutional encoder that extracts a compact representation of the frequency patterns, and these encoded sequences are then processed with a transformer model applied along the time dimension to extract temporal information. Finally, a small feed-forward network maps the model's output to note predictions over time.
 
-These encoded sequences are then processed with a transformer model applied along the time dimension to extract long-range temporal information. Finally, a small feed-forward network maps the transformer’s output to note predictions over time.
+<div align="center">
+  <img src="images/Processing-Flow.png" width="800" height="480" alt="Processing-Flow"/>
+  <figcaption><em>Figure 1. Illustration of classification process.</em></figcaption>
+  <br>
+</div>
 
-TODO: add image of this process
-
-For training we use binary cross-entropy loss, and for accuracy we count the number of time-steps where the model correctly predicted every single note.
+For training, I used the <a href="https://zenodo.org/records/5120004">Musicnet dataset</a>, a collection of ~300 freely-licensed classical recordings annotated by experts. The training objective is binary cross-entropy loss, and the accuracy is the fraction of time-steps where the model correctly predicted every single note.
 
 ## Usage
 
@@ -42,7 +44,7 @@ Default options:
 
 `--hop-length 512` - hop length for the transform
 
-`--all-notes` - if provided, use full note range (otherwise notes modulo 12)
+`--only-note-names` - if provided, use notes modulo 12
 
 `--n-batches 60` - number of batches to save per file
 
@@ -50,7 +52,7 @@ Default options:
 
 To train a transformer model and evaluate it:
 
-```python -m your_module train```
+```python src train```
 
 Default options:
 
@@ -74,11 +76,13 @@ Default options:
 
 `--embed-dim 192` - embedding dimension
 
-`--load-weights` - path to a checkpoint file to resume from
+`--load-weights` - either "main" or "dev", which model (if any) to continue training
 
-## Current architecture
+## Architecture
 
-CNN encoding + Transformer + MLP decoder: `n_layers=4`, `n_heads=4`, `head_dim=32`, `c=3`, `embed_dim=192` (1.8M params).
+The current architecture is a small CNN encoder followed by multiple Transformer layers and a small MLP decoder. The Transformer contains Self-Attention (which extracts temporal features) and MLP layers (which extract frequency features).
+
+`model_weights.pth`: `n_layers=4`, `n_heads=4`, `head_dim=32`, `c=3`, `embed_dim=192` (1.8M params).
 - Best learning rate found: `lr=5e-4`, `test_acc = 30%` (`43%` for note names)
 - Validation stopped improving at `loss=3.9`, `acc=30%`, while training loss reached `loss=3.7`
 
@@ -103,3 +107,5 @@ CNN encoding + Transformer + MLP decoder: `n_layers=4`, `n_heads=4`, `head_dim=3
 - Try training a larger model to see if the test accuracy plateau is a consequence of model expresivity or of data.
 
 - Try different pre-processing techniques besides STFT and Constant-Q transform to see if this is why the model still has low accuracy.
+
+- Once a better model is trained, implement a real time pipeline to use it.
