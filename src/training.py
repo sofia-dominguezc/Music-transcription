@@ -1,5 +1,5 @@
-from typing import Optional, Sequence
 from math import log
+from typing import Optional
 
 import torch
 from torch import nn, optim, Tensor
@@ -78,7 +78,8 @@ class MusicTransformer(nn.Module):
         input_freq: int = 12 * 8 * 4,
         embed_dim: int = 128,
         n_notes: int = 12 * 8,
-        t_batch: int = 22050 // 512,
+        time_dim: int = 22050 // 512,
+        t_batch: int = 60,
     ):
         super().__init__()
         self.tokenizer = nn.Sequential(  # (batch, freq) -> (batch, embed_dim)
@@ -90,10 +91,17 @@ class MusicTransformer(nn.Module):
             nn.Flatten(-2),
             nn.Linear(c**2 * ((input_freq+3)//4), embed_dim),
         )
-        self.pos_enc = nn.Buffer(positional_encoding(t_batch, embed_dim), persistent=False)
+        self.s_pos_enc = nn.Buffer(positional_encoding(time_dim, embed_dim), persistent=False)
+        self.l_pos_enc = nn.Buffer(positional_encoding(t_batch, embed_dim), persistent=False)
         self.decoder = nn.Linear(embed_dim, n_notes)
 
-        self.attn = nn.ModuleList(
+        self.s_attn = nn.ModuleList(
+            (
+                SelfAttention(input_dim=embed_dim, qk_dim=head_dim*n_heads, n_heads=n_heads)
+                for _ in range(n_layers)
+            ),
+        )
+        self.l_attn = nn.ModuleList(
             (
                 SelfAttention(input_dim=embed_dim, qk_dim=head_dim*n_heads, n_heads=n_heads)
                 for _ in range(n_layers)
@@ -112,27 +120,36 @@ class MusicTransformer(nn.Module):
             ),
         )
 
-    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor, mask: Tensor) -> Tensor:
         """
-        x: (batch, second, freq)
-        mask: (batch, second)
-        Self-attention over time with CNN as positional encoding
+        x: (batch, t_batch, time, freq)
+        mask: (batch, t_batch)
+        Criss-cross attention over short and long time range
         """
-        batch = x.shape[0]
-        x = self.tokenizer(x.flatten(0, 1)).unflatten(0, (batch, -1))  # (batch, time, embed_dim)
-        x = x + self.pos_enc[None, :, :]
+        x = self.tokenizer(x.flatten(0, 2)).unflatten(0, x.shape[:3])
+        x = x + self.s_pos_enc[None, None, :, :]
+        x = x + self.l_pos_enc[None, :, None, :]
 
-        for attn, mlp, ln in zip(self.attn, self.mlp, self.layer_norm):
+        for s_attn, l_attn, mlp, ln in zip(self.s_attn, self.l_attn, self.mlp, self.layer_norm):
             x = ln(x)
-            x = x + attn(x, mask)
+            x = (
+                x + \
+                s_attn(x.flatten(0, 1)).unflatten(0, x.shape[:2]) + \
+                l_attn(x.transpose(1, 2).flatten(0, 1), mask).unflatten(0, (x.shape[0], -1)).transpose(1, 2)
+            )
             x = x + mlp(x)
 
-        x = self.decoder(x)  # (batch, time, output_dim)
+        x = self.decoder(x)
         return x
 
 
 class LitMusicModel(pl.LightningModule):
-    loss_fn = nn.BCEWithLogitsLoss(reduction='mean')
+    """
+    x: (batch, t_batch, time, freq)
+    y: (batch, t_batch, time, notes)
+    mask: (batch, t_batch)
+    """
+    loss_fn = nn.BCEWithLogitsLoss(reduction='none')
     best_val_acc: float
 
     def __init__(
@@ -161,17 +178,13 @@ class LitMusicModel(pl.LightningModule):
             }
         }
 
-    def training_step(
-        self,
-        batch: tuple[Tensor, ...],
-        batch_idx: int,
-    ) -> Tensor:
-        *X, y = [el.to(self.device) for el in batch]
-        logits = self.model(*X)
-        loss = self.loss_fn(logits, y)
+    def training_step(self, batch: tuple[Tensor, ...], batch_idx: int) -> Tensor:
+        x, y, mask = [el.to(self.device) for el in batch]
+        logits = self.model(x, mask)
+        loss = self._loss(logits, y, mask)
 
-        self.log("loss_step", 100 * loss, on_epoch=False, prog_bar=True)
-        self.log("loss_epoch", 100 * loss, on_epoch=True, prog_bar=False)
+        self.log("loss_step", loss, on_epoch=False, prog_bar=True)
+        self.log("loss_epoch", loss, on_epoch=True, prog_bar=False)
         return loss
 
     def on_train_epoch_end(self):
@@ -181,34 +194,29 @@ class LitMusicModel(pl.LightningModule):
             torch.save(self.model.state_dict(), f"{self.params_root}\\{dev_model_weights}")
             self.best_train_loss = loss.item()
 
-    def _acc(
-        self, label: Tensor, pred: Tensor, e: int = 0,
-    ) -> float:
-        """Find fraction of time steps that are fully correctly classified"""
-        correct = torch.sum(pred != label, dim=-1) <= e  # (batch, time)
-        acc = torch.sum(correct) / correct.nelement()
-        return 100 * acc.item()
+    def _loss(self, logits: Tensor, y: Tensor, mask: Tensor) -> Tensor:
+        """
+        # Average loss over time steps
+        Replaced with 100 * full_avg for compatibility
+        """
+        valid = ~mask[:, :, None, None]  # (batch, t_batch, time, notes)
+        loss = self.loss_fn(logits, y) * valid
+        return 100 * torch.sum(loss) / (torch.sum(valid) * y.shape[-2] * y.shape[-1])
 
-    def validation_step(
-        self, batch: tuple[Tensor, ...], batch_idx: int,
-    ) -> None:
-        x, y = batch
-        x, y = x.to(self.device), y.to(self.device)
-        logits = self.model(x)  # (..., T, n_notes)
-        loss = self.loss_fn(logits, y)
-        acc = self._acc(label=y.bool(), pred=(logits >= 0), e=0)
-        self.log("val_loss", 100 * loss, on_epoch=True, prog_bar=True)
+    def validation_step(self, batch: tuple[Tensor, ...], batch_idx: int):
+        x, y, mask = [n.to(self.device) for n in batch]
+        logits = self.model(x, mask)
+        loss = self._loss(logits, y, mask)
+        acc = self._acc(pred=logits >= 0, label=y, mask=mask)
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         self.log("val_acc", acc, on_epoch=True, prog_bar=True)
 
-    def test_step(
-        self, batch: tuple[Tensor, ...], batch_idx: int,
-    ) -> None:
-        x, y = batch
-        x, y = x.to(self.device), y.to(self.device)
-        logits = self.model(x)
+    def test_step(self, batch: tuple[Tensor, ...], batch_idx: int):
+        x, y, mask = [n.to(self.device) for n in batch]
+        logits = self.model(x, mask)
         # full case
         for e in self.allowed_errors:
-            acc = self._acc(label=y.bool(), pred=(logits >= 0), e=e)
+            acc = self._acc(pred=(logits >= 0), label=y.bool(), mask=mask, e=e)
             self.log(
                 f"Test accuracy (errors={e})",
                 acc, on_epoch=True, prog_bar=True,
@@ -217,11 +225,20 @@ class LitMusicModel(pl.LightningModule):
         label = y.unflatten(-1, (12, -1)).any(dim=-1)
         pred = (logits.unflatten(-1, (12, -1)) >= 0).any(dim=-1)
         for e in self.allowed_errors:
-            acc = self._acc(label, pred, e=e)
+            acc = self._acc(pred=pred, label=label, mask=mask, e=e)
             self.log(
                 f"Test accuracy (errors={e}, only note names)",
                 acc, on_epoch=True, prog_bar=True,
             )
+
+    def _acc(self, pred: Tensor, label: Tensor, mask: Tensor, e: int = 0) -> float:
+        """
+        Fraction of time steps that are fully correctly classified
+        """
+        valid = ~mask[:, :, None]  # (batch, t_batch, time)
+        correct = torch.sum(pred.bool() != label.bool(), dim=-1) <= e
+        acc = torch.sum(correct & valid) / (torch.sum(valid) * label.shape[-2])
+        return 100 * acc.item()
 
 
 def train(

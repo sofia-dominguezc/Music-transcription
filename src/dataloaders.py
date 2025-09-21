@@ -44,6 +44,8 @@ class GroupedTensorDataset(Dataset[tuple[Tensor, Tensor]]):
 
 class LazyTensorDataset(Dataset[tuple[Tensor, ...]]):
     """Stores a list of files (e.g. ["1727", "1728"]) and loads in __getitem__"""
+    t_batch = 60  # max number of time chunks per file, must match n-batches in __main__
+
     def __init__(
         self,
         files: list[str],
@@ -60,8 +62,9 @@ class LazyTensorDataset(Dataset[tuple[Tensor, ...]]):
     def __getitem__(self, index: int) -> tuple[Tensor, ...]:
         """
         Returns:
-            x_tensor: (batch, time, notes)
-            y_tensor: (batch, time, notes)
+            x_tensor: (t_batch, time, notes)
+            y_tensor: (t_batch, time, notes)
+            mask:     (t_batch, )
         """
         x_file = f"{self.root}\\{self.split}_data\\{self.files[index]}.npy"
         x_array = np.load(x_file)
@@ -71,7 +74,17 @@ class LazyTensorDataset(Dataset[tuple[Tensor, ...]]):
         y_array = np.load(y_file)
         y_tensor = torch.from_numpy(y_array).to(torch.float64)
 
-        return x_tensor, y_tensor
+        seq_len = x_tensor.shape[0]
+        pad_len = self.t_batch - seq_len
+        assert pad_len >= 0, "Sequence length larger than max_time"
+
+        x_padded = nn.functional.pad(x_tensor, (0, 0, 0, pad_len), value=0)
+        y_padded = nn.functional.pad(y_tensor, (0, 0, 0, pad_len), value=0)
+        mask = torch.zeros(self.t_batch, dtype=torch.bool)
+        mask[seq_len:] = True
+
+        return x_padded, mask, y_padded
+
 
 def collate_samples(batches: list[tuple[Tensor, ...]]) -> tuple[Tensor, ...]:
     """
@@ -146,7 +159,7 @@ def create_lazy_dataloader(
         dataset,
         batch_size,
         shuffle=(split=="train"),
-        collate_fn=collate_samples,
+        # collate_fn=collate_samples,
         **workers_args,
     )
     return dataloader
