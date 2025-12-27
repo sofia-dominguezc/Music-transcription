@@ -1,13 +1,11 @@
 import os
 import numpy as np
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 from typing import Literal
 
-from preprocess_data import save_path
-
-max_time = 90 * (22050 // 512)  # max length of batch is 90s
+from preprocessing import processed_path
 
 
 class GroupedTensorDataset(Dataset[tuple[Tensor, Tensor]]):
@@ -43,12 +41,12 @@ class GroupedTensorDataset(Dataset[tuple[Tensor, Tensor]]):
 
 
 class LazyTensorDataset(Dataset[tuple[Tensor, ...]]):
-    """Stores a list of files (e.g. ["1727", "1728"]) and loads in __getitem__"""
+    """Stores a list of files (e.g. ["1727_0", "1728_5"]) and loads in __getitem__"""
     def __init__(
         self,
         files: list[str],
         split: Literal["train", "test"],
-        root: str = save_path,
+        root: str = processed_path,
     ):
         self.files = files
         self.split = split
@@ -63,15 +61,16 @@ class LazyTensorDataset(Dataset[tuple[Tensor, ...]]):
             x_tensor: (batch, time, notes)
             y_tensor: (batch, time, notes)
         """
-        x_file = f"{self.root}\\{self.split}_data\\{self.files[index]}.npy"
+        x_file = os.path.join(self.root, f"{self.split}_data", f"{self.files[index]}.npy")
         x_array = np.load(x_file)
         x_tensor = torch.from_numpy(x_array).to(torch.float32)
 
-        y_file = f"{self.root}\\{self.split}_labels\\{self.files[index]}.npy"
+        y_file = os.path.join(self.root, f"{self.split}_labels", f"{self.files[index]}.npy")
         y_array = np.load(y_file)
         y_tensor = torch.from_numpy(y_array).to(torch.float64)
 
         return x_tensor, y_tensor
+
 
 def collate_samples(batches: list[tuple[Tensor, ...]]) -> tuple[Tensor, ...]:
     """
@@ -97,11 +96,11 @@ def create_dataloader(
     torch.cuda.empty_cache()
 
     x_array, y_array = [], []
-    for f in os.listdir(os.fsencode(f"{save_path}\\{split}_data")):
+    for f in os.listdir(os.fsencode(f"{processed_path}\\{split}_data")):
         file = os.fsdecode(f)
         assert file.endswith(".npy"), f"Invalid file: {file}"
-        song_vals = np.load(f"{save_path}\\{split}_data\\{file}")
-        labels = np.load(f"{save_path}\\{split}_labels\\{file}")
+        song_vals = np.load(f"{processed_path}\\{split}_data\\{file}")
+        labels = np.load(f"{processed_path}\\{split}_labels\\{file}")
         x_array.append(song_vals)
         y_array.append(labels)
     dataset = GroupedTensorDataset(x_array, y_array)
@@ -121,7 +120,7 @@ def create_lazy_dataloader(
     split: Literal["train", "test"],
     batch_size: int,
     num_workers: int = 0,
-    root: str = save_path,
+    root: str = processed_path,
 ) -> DataLoader[tuple[Tensor, ...]]:
     """
     Make "lazy" dataloader from a list of song files.
@@ -132,21 +131,22 @@ def create_lazy_dataloader(
     files = []
     for f in os.listdir(os.fsencode(f"{root}\\{split}_data")):
         file = os.fsdecode(f)
-        assert file.endswith(".npy"), f"Invalid file: {file}"
-        files.append(file[:-len(".npy")])
+        data_id, ext = file.split('.')
+        assert ext == "npy", f"Invalid file: {file}"
+        files.append(data_id)
     dataset = LazyTensorDataset(files, split, root=root)
 
-    workers_args = {
+    worker_args = {
         "num_workers": num_workers,
         "pin_memory": True,
         "persistent_workers": True,
-        "prefetch_factor": 12,
+        "prefetch_factor": 24,
     } if num_workers > 0 else {}
     dataloader = DataLoader(
         dataset,
         batch_size,
         shuffle=(split=="train"),
         collate_fn=collate_samples,
-        **workers_args,
+        **worker_args,
     )
     return dataloader

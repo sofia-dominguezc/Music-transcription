@@ -1,134 +1,102 @@
-from typing import Optional, Sequence
 from math import log
+import lightning as pl
+from einops import rearrange
 
 import torch
 from torch import nn, optim, Tensor
 from torch.utils.data import DataLoader
-import lightning as pl
 
 model_weights = "parameters\\model_weights.pth"
 dev_model_weights = "parameters\\dev_model_weights.pth"
 
 
-def positional_encoding(seq: int, dim: int):
-    """Sinusoidal positional encoding of shape (seq, dim)"""
-    pe = torch.zeros(seq, dim)
-    position = torch.arange(0, seq).unsqueeze(1)  # (seq, 1)
-    div_term = torch.exp(torch.arange(0, dim, 2) * (-log(3 * seq) / dim))
-    pe[:, 0::2] = torch.sin(position * div_term)
-    pe[:, 1::2] = torch.cos(position * div_term)
-    return pe
-
-
-class SelfAttention(nn.Module):
-    def __init__(self, input_dim: int, qk_dim: int, n_heads: int):
+class TransformerLayer(nn.Module):
+    def __init__(self, dim=48, num_heads=4, mlp_ratio=4.0):
         super().__init__()
-        assert qk_dim % n_heads == 0, "Head dims must divide evenly"
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
 
-        self.qk_dim = qk_dim
-        self.v_dim = qk_dim
-        self.n_heads = n_heads
-        self.qk_head_dim = qk_dim // n_heads
-        self.v_head_dim = qk_dim // n_heads
+        self.pos_encoding: torch.Tensor
+        self.register_buffer("pos_encoding", self._make_pos_encoding(dim=dim, max_len=1024))
 
-        self.q_proj = nn.Linear(input_dim, qk_dim)
-        self.k_proj = nn.Linear(input_dim, qk_dim)
-        self.v_proj = nn.Linear(input_dim, self.v_dim)
-        self.out_proj = nn.Linear(self.v_dim, input_dim)
-
-    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
-        """
-        x: (batch, seq, input_dim)
-        mask: (batch, seq)
-        Attention is applied over seq
-        """
-        batch, seq, _ = x.shape
-
-        Q = self.q_proj(x)  # [batch, seq, qk_dim]
-        K = self.k_proj(x)  # [batch, seq, qk_dim]
-        V = self.v_proj(x)  # [batch, seq, v_dim]
-
-        Q = Q.view(batch, seq, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, qk_head_dim]
-        K = K.view(batch, seq, self.n_heads, self.qk_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, qk_head_dim]
-        V = V.view(batch, seq, self.n_heads, self.v_head_dim).transpose(-2, -3)  # [batch, n_heads, seq, v_head_dim]
-
-        scores: Tensor = Q @ K.transpose(-2, -1) / (self.qk_head_dim ** 0.5)  # [batch, n_heads, seq, seq]
-        if mask is not None:
-            scores = scores.masked_fill(mask[:, None, None, :], value=float('-inf'))
-
-        attn_weights = nn.functional.softmax(scores, dim=-1)  # [batch, n_heads, seq, seq]
-        attn_output = torch.matmul(attn_weights, V)  # [batch, n_heads, seq, v_head_dim]
-        attn_output = attn_output.transpose(-2, -3).contiguous().view(batch, seq, self.v_dim)  # [batch, seq, v_dim]
-
-        out = self.out_proj(attn_output)  # [batch, seq, input_dim]
-        return out
-
-
-class MusicTransformer(nn.Module):
-    """
-    The architecture was inspired by a Vision Transformer,
-    except that it uses criss-cross attention instead of full attention
-    """
-    def __init__(
-        self,
-        n_layers: int = 2,
-        n_heads: int = 4,
-        head_dim: int = 32,
-        c: int = 3,
-        input_freq: int = 12 * 8 * 4,
-        embed_dim: int = 128,
-        n_notes: int = 12 * 8,
-        t_batch: int = 22050 // 512,
-    ):
-        super().__init__()
-        self.tokenizer = nn.Sequential(  # (batch, freq) -> (batch, embed_dim)
-            nn.Unflatten(-1, (1, -1)),
-            nn.Conv1d(1, c, kernel_size=5, padding=2, stride=2),
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, int(dim * mlp_ratio)),
             nn.GELU(),
-            nn.Conv1d(c, c**2, kernel_size=5, padding=2, stride=2),
-            nn.GELU(),
-            nn.Flatten(-2),
-            nn.Linear(c**2 * ((input_freq+3)//4), embed_dim),
-        )
-        self.pos_enc = nn.Buffer(positional_encoding(t_batch, embed_dim), persistent=False)
-        self.decoder = nn.Linear(embed_dim, n_notes)
-
-        self.attn = nn.ModuleList(
-            (
-                SelfAttention(input_dim=embed_dim, qk_dim=head_dim*n_heads, n_heads=n_heads)
-                for _ in range(n_layers)
-            ),
-        )
-        self.layer_norm = nn.ModuleList(
-            (nn.LayerNorm(embed_dim) for _ in range(n_layers))
-        )
-        self.mlp = nn.ModuleList(
-            (
-                nn.Sequential(
-                    nn.Linear(embed_dim, 4*embed_dim),
-                    nn.GELU(),
-                    nn.Linear(4*embed_dim, embed_dim),
-                ) for _ in range(n_layers)
-            ),
+            nn.Linear(int(dim * mlp_ratio), dim),
         )
 
-    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
-        """
-        x: (batch, second, freq)
-        mask: (batch, second)
-        Self-attention over time with CNN as positional encoding
-        """
-        batch = x.shape[0]
-        x = self.tokenizer(x.flatten(0, 1)).unflatten(0, (batch, -1))  # (batch, time, embed_dim)
-        x = x + self.pos_enc[None, :, :]
+    def _make_pos_encoding(self, dim, max_len):
+        pe = torch.zeros(max_len, dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-log(10000.0) / dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
 
-        for attn, mlp, ln in zip(self.attn, self.mlp, self.layer_norm):
-            x = ln(x)
-            x = x + attn(x, mask)
-            x = x + mlp(x)
+    def forward(self, x):
+        batch, seq, dim = x.shape
+        x = x + self.pos_encoding[:seq].unsqueeze(0)
 
-        x = self.decoder(x)  # (batch, time, output_dim)
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = x + attn_out
+
+        x_norm = self.norm2(x)
+        mlp_out = self.mlp(x_norm)
+        x = x + mlp_out
+
         return x
+
+
+class MusicTranscription(nn.Module):
+    """
+    ViT with (deep) convolutional encoder-decoder
+    NOTE: the time and frequency resolutions are hard-coded
+        at hop_size=256, bins_per_note=8
+    """
+    def __init__(self, dim=48, n_heads=3, depth=4, n_octaves=8):
+        super().__init__()
+        self.tokenizer = nn.Sequential(  # (time, freq) -> (time//48, freq//48)
+            nn.Conv2d(1, dim//4, kernel_size=5, stride=3),
+            nn.GELU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(dim//4, dim//2, kernel_size=3, stride=2, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.GELU(),
+            nn.Conv2d(dim//2, dim, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        self.model = nn.Sequential(*(
+            TransformerLayer(dim=dim, num_heads=n_heads, mlp_ratio=4.0)
+            for _ in range(depth)
+        ))
+        self.decoder = nn.Sequential(  # (time, freq) -> (time*48, freq*6)
+            nn.ConvTranspose2d(dim, dim//2, kernel_size=(6, 3), stride=(6, 3)),
+            nn.GELU(),
+            nn.ConvTranspose2d(dim//2, 1, kernel_size=(8, 2), stride=(8, 2)),
+        )
+        self.n_octaves = n_octaves
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, time, freq)
+        """
+        x = x.unsqueeze(1)
+        x = self.tokenizer(x)
+
+        x = rearrange(x, "b c t f -> b (t f) c")
+        x = self.model(x)
+
+        x = x.unflatten(1, (-1, self.n_octaves * 2))
+        x = rearrange(x, "b t f c -> b c t f")
+        x = self.decoder(x)
+
+        return x.squeeze(1)
 
 
 class LitMusicModel(pl.LightningModule):
@@ -138,8 +106,8 @@ class LitMusicModel(pl.LightningModule):
     def __init__(
         self,
         model: nn.Module,
-        optimizer: Optional[optim.Optimizer] = None,
-        scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
+        optimizer: optim.Optimizer | None = None,
+        scheduler: optim.lr_scheduler.LRScheduler | None = None,
         allowed_errors: list[int] = [0],
         params_root: str = ".",
     ) -> None:
@@ -166,12 +134,13 @@ class LitMusicModel(pl.LightningModule):
         batch: tuple[Tensor, ...],
         batch_idx: int,
     ) -> Tensor:
-        *X, y = [el.to(self.device) for el in batch]
-        logits = self.model(*X)
+        x, y = batch
+        x, y = x.to(self.device), y.to(self.device)
+        logits = self.model(x)
         loss = self.loss_fn(logits, y)
 
-        self.log("loss_step", 100 * loss, on_epoch=False, prog_bar=True)
-        self.log("loss_epoch", 100 * loss, on_epoch=True, prog_bar=False)
+        self.log("loss_step", loss, on_epoch=False, prog_bar=True)
+        self.log("loss_epoch", loss, on_epoch=True, prog_bar=False)
         return loss
 
     def on_train_epoch_end(self):
@@ -184,7 +153,7 @@ class LitMusicModel(pl.LightningModule):
     def _acc(
         self, label: Tensor, pred: Tensor, e: int = 0,
     ) -> float:
-        """Find fraction of time steps that are fully correctly classified"""
+        """Find fraction of time steps that are classified with <= e errors"""
         correct = torch.sum(pred != label, dim=-1) <= e  # (batch, time)
         acc = torch.sum(correct) / correct.nelement()
         return 100 * acc.item()
@@ -197,7 +166,7 @@ class LitMusicModel(pl.LightningModule):
         logits = self.model(x)  # (..., T, n_notes)
         loss = self.loss_fn(logits, y)
         acc = self._acc(label=y.bool(), pred=(logits >= 0), e=0)
-        self.log("val_loss", 100 * loss, on_epoch=True, prog_bar=True)
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         self.log("val_acc", acc, on_epoch=True, prog_bar=True)
 
     def test_step(
@@ -214,8 +183,8 @@ class LitMusicModel(pl.LightningModule):
                 acc, on_epoch=True, prog_bar=True,
             )
         # only notes case
-        label = y.unflatten(-1, (12, -1)).any(dim=-1)
-        pred = (logits.unflatten(-1, (12, -1)) >= 0).any(dim=-1)
+        label = y.unflatten(-1, (-1, 12)).any(dim=-2)
+        pred = (logits.unflatten(-1, (-1, 12)) >= 0).any(dim=-2)
         for e in self.allowed_errors:
             acc = self._acc(label, pred, e=e)
             self.log(
@@ -229,11 +198,11 @@ def train(
     train_loader: DataLoader,
     lr: float,
     total_epochs: int,
-    val_loader: Optional[DataLoader] = None,
+    val_loader: DataLoader | None = None,
     params_root: str = ".",
 ) -> None:
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=10*lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, total_epochs, eta_min=0.01*lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, total_epochs, eta_min=0.1*lr)
     plmodel = LitMusicModel(model, optimizer, scheduler, params_root=params_root)
     trainer = pl.Trainer(max_epochs=total_epochs, logger=False, enable_checkpointing=False)
     trainer.fit(plmodel, train_loader, val_loader)
@@ -271,15 +240,15 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')
     from dataloaders import create_lazy_dataloader
 
-    model = MusicTransformer(n_layers=4, n_heads=4, head_dim=32, c=3, embed_dim=192)
+    model = MusicTranscription(dim=48, n_heads=4, depth=2, n_octaves=8)
     # model.load_state_dict(torch.load("parameters\\model_weights.pth"))
-    train_loader = create_lazy_dataloader(split="train", batch_size=8, num_workers=8)
-    val_loader = create_lazy_dataloader(split="test", batch_size=1, num_workers=0)
+    train_loader = create_lazy_dataloader(split="train", batch_size=32, num_workers=12)
+    val_loader = create_lazy_dataloader(split="test", batch_size=8, num_workers=0)
 
     train(
         model,
         train_loader,
-        lr=5e-4,
+        lr=2e-3,
         total_epochs=25,
         val_loader=val_loader,
     )

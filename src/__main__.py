@@ -2,7 +2,7 @@ import argparse
 
 
 def run_preprocess(args):
-    from preprocess_data import process_data
+    from preprocessing import process_data
     process_data(
         split=args.split,
         num_workers=args.num_workers,
