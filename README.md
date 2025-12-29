@@ -113,3 +113,23 @@ The current architecture is a small CNN encoder followed by multiple Transformer
 - Try different pre-processing techniques besides STFT and Constant-Q transform to see if this is why the model still has low accuracy.
 
 - Once a better model is trained, implement a real time pipeline to use it.
+
+### New experiments
+
+I tried the model where I take a [0.5 octaves, 0.5 seconds] block and encode it as a vector, then do attention and then decode it.
+
+- First model: `dim=48` and `100k` parameters for 20 epochs. Achieved acc `19.3` (`28.6` only note names)
+
+- Second model: `dim=96` and `800k` parameters. Achieved acc `30.6` (~`40.0` only note names) by epoch 22
+
+This worked equally well with `filter_scale=0.25` than with `0.5`
+
+- Third model: `dim=192` and `3.2M` parameters. Achieved acc `32.5` (~`43.3` only note names) by epoch 12, and 30% at epoch 7
+
+Some conclusions:
+
+- Validation loss got stuck at the same value as before. This is definitely a data problem, I think the Q-transform looses too much information.
+
+- I think training was faster here (19% epoch 3, 25% epoch 7, 29% epoch 14, and then stuck for 25 more epochs)
+
+- It's time to move on to time-based methos

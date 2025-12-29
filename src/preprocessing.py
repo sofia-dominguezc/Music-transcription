@@ -39,7 +39,7 @@ def batched_q_transform(
         hop_length=hop_length,
         n_bins=n_octaves*bins_per_note*12,
         bins_per_octave=bins_per_note*12,
-        filter_scale=0.5,
+        filter_scale=0.25,
         fmin=librosa.note_to_hz('C1'),
         scale=True,
     )
@@ -174,8 +174,8 @@ def process_data(split: Literal["train", "test"], num_workers: int = 8, **args):
 
 if __name__ == "__main__":
     process_data(
-        split="train",
-        num_workers=6,
+        split="test",
+        num_workers=5,
         batch_seconds=10.05,
         bins_per_note=8,
         n_octaves=8,

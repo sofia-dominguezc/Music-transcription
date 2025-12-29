@@ -18,11 +18,14 @@ class TransformerLayer(nn.Module):
         self.head_dim = dim // num_heads
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
 
-        self.pos_encoding: torch.Tensor
-        self.register_buffer("pos_encoding", self._make_pos_encoding(dim=dim, max_len=1024))
+        self.pos1: torch.Tensor
+        self.register_buffer("pos1", self._make_pos_encoding(dim=dim, max_len=2048))
+        self.pos2: torch.Tensor
+        self.register_buffer("pos2", self._make_pos_encoding(dim=dim, max_len=2048))
 
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.attn1 = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.attn2 = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, int(dim * mlp_ratio)),
@@ -39,12 +42,19 @@ class TransformerLayer(nn.Module):
         return pe
 
     def forward(self, x):
-        batch, seq, dim = x.shape
-        x = x + self.pos_encoding[:seq].unsqueeze(0)
-
+        batch, seq1, seq2, dim = x.shape
+        x = x + self.pos1[None, :seq1, None, :] + self.pos2[None, None, :seq2, :]
         x_norm = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x = x + attn_out
+
+        x1 = rearrange(x_norm, "b t f d -> (b f) t d")
+        attn_out1, _ = self.attn1(x1, x1, x1)
+        attn_out1 = attn_out1.unflatten(0, (batch, seq2)).transpose(1, 2)
+
+        x2 = rearrange(x_norm, "b t f d -> (b t) f d")
+        attn_out2, _ = self.attn1(x2, x2, x2)
+        attn_out2 = attn_out2.unflatten(0, (batch, seq1))
+
+        x = x + attn_out1 + attn_out2
 
         x_norm = self.norm2(x)
         mlp_out = self.mlp(x_norm)
@@ -66,7 +76,6 @@ class MusicTranscription(nn.Module):
             nn.GELU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Conv2d(dim//4, dim//2, kernel_size=3, stride=2, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
             nn.GELU(),
             nn.Conv2d(dim//2, dim, kernel_size=3, stride=2, padding=1),
             nn.GELU(),
@@ -78,7 +87,7 @@ class MusicTranscription(nn.Module):
         self.decoder = nn.Sequential(  # (time, freq) -> (time*48, freq*6)
             nn.ConvTranspose2d(dim, dim//2, kernel_size=(6, 3), stride=(6, 3)),
             nn.GELU(),
-            nn.ConvTranspose2d(dim//2, 1, kernel_size=(8, 2), stride=(8, 2)),
+            nn.ConvTranspose2d(dim//2, 1, kernel_size=(4, 1), stride=(4, 1)),
         )
         self.n_octaves = n_octaves
 
@@ -89,10 +98,9 @@ class MusicTranscription(nn.Module):
         x = x.unsqueeze(1)
         x = self.tokenizer(x)
 
-        x = rearrange(x, "b c t f -> b (t f) c")
+        x = rearrange(x, "b c t f -> b t f c")
         x = self.model(x)
 
-        x = x.unflatten(1, (-1, self.n_octaves * 2))
         x = rearrange(x, "b t f c -> b c t f")
         x = self.decoder(x)
 
@@ -201,8 +209,8 @@ def train(
     val_loader: DataLoader | None = None,
     params_root: str = ".",
 ) -> None:
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=10*lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, total_epochs, eta_min=0.1*lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01*lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, total_epochs, eta_min=0.01*lr)
     plmodel = LitMusicModel(model, optimizer, scheduler, params_root=params_root)
     trainer = pl.Trainer(max_epochs=total_epochs, logger=False, enable_checkpointing=False)
     trainer.fit(plmodel, train_loader, val_loader)
@@ -240,16 +248,16 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')
     from dataloaders import create_lazy_dataloader
 
-    model = MusicTranscription(dim=48, n_heads=4, depth=2, n_octaves=8)
+    model = MusicTranscription(dim=48, n_heads=6, depth=6, n_octaves=8)
     # model.load_state_dict(torch.load("parameters\\model_weights.pth"))
-    train_loader = create_lazy_dataloader(split="train", batch_size=32, num_workers=12)
+    train_loader = create_lazy_dataloader(split="train", batch_size=32, num_workers=8)
     val_loader = create_lazy_dataloader(split="test", batch_size=8, num_workers=0)
 
     train(
         model,
         train_loader,
-        lr=2e-3,
-        total_epochs=25,
+        lr=1e-3,
+        total_epochs=30,
         val_loader=val_loader,
     )
 

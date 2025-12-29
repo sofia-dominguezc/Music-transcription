@@ -140,7 +140,7 @@ def create_lazy_dataloader(
         "num_workers": num_workers,
         "pin_memory": True,
         "persistent_workers": True,
-        "prefetch_factor": 24,
+        # "prefetch_factor": 36,
     } if num_workers > 0 else {}
     dataloader = DataLoader(
         dataset,
