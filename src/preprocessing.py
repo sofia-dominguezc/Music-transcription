@@ -174,13 +174,13 @@ def process_data(split: Literal["train", "test"], num_workers: int = 8, **args):
 
 if __name__ == "__main__":
     process_data(
-        split="test",
-        num_workers=5,
-        batch_seconds=10.05,
+        split="train",
+        num_workers=12,
+        batch_seconds=2.03,
         bins_per_note=8,
         n_octaves=8,
         sr=22050,
         hop_length=256,
         all_notes=True,
-        batch_size=1,
+        batch_size=5,
     )
