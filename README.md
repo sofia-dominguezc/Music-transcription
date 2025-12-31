@@ -126,10 +126,20 @@ This worked equally well with `filter_scale=0.25` than with `0.5`
 
 - Third model: `dim=192` and `3.2M` parameters. Achieved acc `32.5` (~`43.3` only note names) by epoch 12, and 30% at epoch 7
 
-Some conclusions:
+I tried the same model but using [0.25 octaves, 0.25 seconds] blocks and criss-cross attention.
 
-- Validation loss got stuck at the same value as before. This is definitely a data problem, I think the Q-transform looses too much information.
+- `dim=96` and `1M` parameter model achieves `37.2` (~`50%` only note names) by epoch 19.
 
-- I think training was faster here (19% epoch 3, 25% epoch 7, 29% epoch 14, and then stuck for 25 more epochs)
+![alt text](images/test_results.png)
 
-- It's time to move on to time-based methos
+Something interesting is that models that perform better do so even if the training loss is higher. They generalize better.
+
+### Best architecture
+
+It's a combination of transformers and CNNs. Take the input (time, freq, dim), apply 1D convolutions in the time axis and self-attention in the frequency axis.
+
+I use a 5 second window with 8 samples per note. The patch size is [0.41 seconds, 0.25 octaves]
+
+- `dim=96`, `depth=3`, `400K` parameter model achieves `43.5%` accuracy 
+
+![alt text](images/test_results_2.png)
