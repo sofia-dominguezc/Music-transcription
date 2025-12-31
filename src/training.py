@@ -18,11 +18,6 @@ class TransformerLayer(nn.Module):
         self.head_dim = dim // num_heads
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
 
-        self.pos1: torch.Tensor
-        self.register_buffer("pos1", self._make_pos_encoding(dim=dim, max_len=2048))
-        self.pos2: torch.Tensor
-        self.register_buffer("pos2", self._make_pos_encoding(dim=dim, max_len=2048))
-
         self.norm1 = nn.LayerNorm(dim)
         self.attn1 = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         self.attn2 = nn.MultiheadAttention(dim, num_heads, batch_first=True)
@@ -33,17 +28,8 @@ class TransformerLayer(nn.Module):
             nn.Linear(int(dim * mlp_ratio), dim),
         )
 
-    def _make_pos_encoding(self, dim, max_len):
-        pe = torch.zeros(max_len, dim)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-log(10000.0) / dim))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        return pe
-
     def forward(self, x):
         batch, seq1, seq2, dim = x.shape
-        x = x + self.pos1[None, :seq1, None, :] + self.pos2[None, None, :seq2, :]
         x_norm = self.norm1(x)
 
         x1 = rearrange(x_norm, "b t f d -> (b f) t d")
@@ -69,41 +55,51 @@ class MusicTranscription(nn.Module):
     NOTE: the time and frequency resolutions are hard-coded
         at hop_size=256, bins_per_note=8
     """
-    def __init__(self, dim=48, n_heads=3, depth=4, n_octaves=8):
+    def __init__(self, dim=96, n_heads=3, depth=3, n_octaves=8):
         super().__init__()
-        self.tokenizer = nn.Sequential(  # (time, freq) -> (time//48, freq//48)
+        self.encoder = nn.Sequential(  # (time, freq) -> (time//12, freq//24)
             nn.Conv2d(1, dim//4, kernel_size=5, stride=3),
             nn.GELU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Conv2d(dim//4, dim//2, kernel_size=3, stride=2, padding=1),
             nn.GELU(),
-            nn.Conv2d(dim//2, dim, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(dim//2, dim, kernel_size=3, stride=(1, 2), padding=1),
             nn.GELU(),
         )
         self.model = nn.Sequential(*(
             TransformerLayer(dim=dim, num_heads=n_heads, mlp_ratio=4.0)
             for _ in range(depth)
         ))
-        self.decoder = nn.Sequential(  # (time, freq) -> (time*48, freq*6)
-            nn.ConvTranspose2d(dim, dim//2, kernel_size=(6, 3), stride=(6, 3)),
-            nn.GELU(),
-            nn.ConvTranspose2d(dim//2, 1, kernel_size=(4, 1), stride=(4, 1)),
-        )
+        self.decoder = nn.ConvTranspose2d(dim, 1, kernel_size=(12, 3), stride=(12, 3))
+
+        self.pos: torch.Tensor
+        self.register_buffer("pos", self._make_pos_encoding(dim=dim, max_len=64))
         self.n_octaves = n_octaves
+
+    def _make_pos_encoding(self, dim, max_len):
+        pe = torch.zeros(max_len, max_len, dim)
+        t = torch.arange(0, max_len, dtype=torch.float)[:, None, None]
+        s = torch.arange(0, max_len, dtype=torch.float)[None, :, None]
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-log(10000.0) / dim))
+
+        pe[:, :, 0::2] = torch.sin(t * div_term + s * div_term)
+        pe[:, :, 1::2] = torch.cos(t * div_term + s * div_term)
+        return pe
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B, time, freq)
         """
         x = x.unsqueeze(1)
-        x = self.tokenizer(x)
+        x = self.encoder(x)
+        batch, _, time, freq = x.shape
 
         x = rearrange(x, "b c t f -> b t f c")
+        x = x + self.pos[None, :time, :freq, :]
         x = self.model(x)
 
         x = rearrange(x, "b t f c -> b c t f")
         x = self.decoder(x)
-
         return x.squeeze(1)
 
 
@@ -248,15 +244,15 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')
     from dataloaders import create_lazy_dataloader
 
-    model = MusicTranscription(dim=48, n_heads=6, depth=6, n_octaves=8)
+    model = MusicTranscription(dim=96, n_heads=3, depth=3, n_octaves=8)
     # model.load_state_dict(torch.load("parameters\\model_weights.pth"))
-    train_loader = create_lazy_dataloader(split="train", batch_size=32, num_workers=8)
-    val_loader = create_lazy_dataloader(split="test", batch_size=8, num_workers=0)
+    train_loader = create_lazy_dataloader(split="train", batch_size=64, num_workers=8)
+    val_loader = create_lazy_dataloader(split="test", batch_size=16, num_workers=0)
 
     train(
         model,
         train_loader,
-        lr=1e-3,
+        lr=3e-3,
         total_epochs=30,
         val_loader=val_loader,
     )
@@ -264,5 +260,5 @@ if __name__ == "__main__":
     test(
         model,
         val_loader,
-        allowed_errors=[0, 1, 2],
+        allowed_errors=[0, 1],
     )

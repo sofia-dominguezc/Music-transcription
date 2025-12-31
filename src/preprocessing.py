@@ -47,7 +47,7 @@ def batched_q_transform(
     spect = (spect - spect.mean()) / spect.std()
     # split into batches
     n_full_time, n_freq = spect.shape
-    n_time = int(batch_seconds * (sr // hop_length))
+    n_time = int(batch_seconds * sr / hop_length)
     n_batch = ceil(n_full_time / n_time)
     full_spect = np.zeros((n_batch * n_time, n_freq))
     full_spect[:n_full_time] = spect
@@ -174,9 +174,9 @@ def process_data(split: Literal["train", "test"], num_workers: int = 8, **args):
 
 if __name__ == "__main__":
     process_data(
-        split="test",
-        num_workers=5,
-        batch_seconds=10.05,
+        split="train",
+        num_workers=12,
+        batch_seconds=5.02,
         bins_per_note=8,
         n_octaves=8,
         sr=22050,
