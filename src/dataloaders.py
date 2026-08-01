@@ -1,43 +1,88 @@
 import os
-import numpy as np
+import zarr
 import torch
+import numpy as np
+from math import ceil
 from torch import Tensor
-from torch.utils.data import Dataset, DataLoader
-from typing import Literal
+from dataclasses import dataclass
+from typing import Literal, Iterator
+from torch.utils.data import Dataset, DataLoader, Sampler, get_worker_info
 
-from preprocessing import processed_path
+from .preprocessing import SR, PROCESSED_DATASET_PATH
 
 
-class GroupedTensorDataset(Dataset[tuple[Tensor, Tensor]]):
-    """Stores a list of numpy arrays with mmap_mode=r"""
-    def __init__(
-        self,
-        x_data: list[np.ndarray],
-        y_data: list[np.ndarray],
-    ) :
-        assert len(x_data) == len(y_data), "Number of groups doesn't match"
-        self.x_data = x_data
-        self.y_data = y_data
-        group_lengths = [a.shape[0] for a in x_data]
-        self.group_idx = np.repeat(
-            np.arange(len(x_data)),
-            group_lengths,
-        )
-        self.cum_lengths = np.cumsum([0] + group_lengths)
+class DistributedTensorDataset(Dataset[tuple[Tensor, Tensor]]):
+    """Loading is distributed accross workers, and each caches its own data
+
+    Args:
+        zarr_path: path to the zarr store. Includes data, labels and cu_seqlens
+        time_chunk: number of seconds in a single item
+    """
+
+    def __init__(self, zarr_path: str, time_chunk: float = 4):
+        self.zarr_data: zarr.Group = zarr.open_group(zarr_path, mode='r')
+        # self.cu_seqlens = self.zarr_data.attrs["cu_seqlens"]  # ignore for now
+        self.x_tensor: torch.Tensor
+        self.y_tensor: torch.Tensor
+
+        self.pid = -1
+        self.time_batch = round(time_chunk * SR / self.zarr_data.attrs["hop_length"])
+        self.total_length = self.zarr_data.attrs["num_entries"]
+
+    @property
+    def _slice_of_worker(self) -> slice:
+        worker_info = get_worker_info()
+        if worker_info is None:
+            return slice(0, len(self))
+        length = ceil(len(self) / worker_info.num_workers)
+        offset = worker_info.id * length
+        return slice(offset, offset + length + self.time_batch)
+
+    def _cache_worker_data(self):
+        if self.pid != os.getpid():
+            self.pid = os.getpid()
+            self.x_tensor = torch.from_numpy(self.zarr_data['data'][self._slice_of_worker])
+            self.y_tensor = torch.from_numpy(self.zarr_data['labels'][self._slice_of_worker])
 
     def __len__(self) -> int:
-        return self.cum_lengths[-1]
+        return self.total_length - (self.time_batch - 1)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
-        group_index = self.group_idx[index]
-        local_index = index - self.cum_lengths[group_index]
-        x_tensor = torch.from_numpy(
-            self.x_data[group_index][local_index]
-        ).to(torch.float32)
-        y_tensor = torch.from_numpy(
-            self.y_data[group_index][local_index]
-        ).to(torch.float64)
-        return x_tensor, y_tensor
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:  # local index
+        self._cache_worker_data()
+        return (
+            self.x_tensor[index: index + self.time_batch].float(),
+            self.y_tensor[index: index + self.time_batch].long(),
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class DistributedSampler(Sampler[list[int]]):
+    """Sample random local indices for each worker, in order.
+    This solves the naive 36% (1/e) repetitions per epoch.
+    """
+
+    length: int
+    batch_size: int
+    num_processes: int
+
+    def __len__(self) -> int:
+        return self.length
+
+    def _num_items(self, worker: int) -> int:
+        local_length = ceil(self.length / self.num_processes)
+        offset = worker * local_length
+        return min(self.length, offset + local_length) - offset
+
+    def __iter__(self) -> Iterator[list[int]]:
+        permutations = [
+            torch.randperm(self._num_items(worker)).tolist()
+            for worker in range(self.num_processes)
+        ]
+        for local_idx in range(0, len(permutations[0]), self.batch_size):
+            for worker in range(self.num_processes):
+                if local_idx >= len(permutations[worker]):
+                    continue
+                yield permutations[worker][local_idx: local_idx + self.batch_size]
 
 
 class LazyTensorDataset(Dataset[tuple[Tensor, ...]]):
@@ -46,7 +91,7 @@ class LazyTensorDataset(Dataset[tuple[Tensor, ...]]):
         self,
         files: list[str],
         split: Literal["train", "test"],
-        root: str = processed_path,
+        root: str = PROCESSED_DATASET_PATH,
     ):
         self.files = files
         self.split = split
@@ -84,7 +129,7 @@ def collate_samples(batches: list[tuple[Tensor, ...]]) -> tuple[Tensor, ...]:
     return tuple(output)
 
 
-def create_dataloader(
+def create_distributed_dataloader(
     split: Literal["train", "test"],
     batch_size: int,
     num_workers: int = 0,
@@ -94,33 +139,27 @@ def create_dataloader(
     If split='train', it will suffle batches even among different songs
     """
     torch.cuda.empty_cache()
-
-    x_array, y_array = [], []
-    for f in os.listdir(os.fsencode(f"{processed_path}\\{split}_data")):
-        file = os.fsdecode(f)
-        assert file.endswith(".npy"), f"Invalid file: {file}"
-        song_vals = np.load(f"{processed_path}\\{split}_data\\{file}")
-        labels = np.load(f"{processed_path}\\{split}_labels\\{file}")
-        x_array.append(song_vals)
-        y_array.append(labels)
-    dataset = GroupedTensorDataset(x_array, y_array)
-
-    workers_args = {
-        "num_workers": num_workers,
-        "pin_memory": True,
-        "persistent_workers": True,
-    } if num_workers > 0 else {}
-    dataloader = DataLoader(
-        dataset, batch_size, shuffle=(split=="train"), **workers_args,
+    zarr_path = f"{PROCESSED_DATASET_PATH}\\{split}.zarr"
+    dataset = DistributedTensorDataset(zarr_path)
+    return DataLoader(
+        dataset,
+        batch_sampler=DistributedSampler(
+            length=len(dataset),
+            batch_size=batch_size,
+            num_processes=num_workers or 1,
+        ),
+        pin_memory=True,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=1,
     )
-    return dataloader
 
 
 def create_lazy_dataloader(
     split: Literal["train", "test"],
     batch_size: int,
     num_workers: int = 0,
-    root: str = processed_path,
+    root: str = PROCESSED_DATASET_PATH,
 ) -> DataLoader[tuple[Tensor, ...]]:
     """
     Make "lazy" dataloader from a list of song files.
@@ -140,7 +179,7 @@ def create_lazy_dataloader(
         "num_workers": num_workers,
         "pin_memory": True,
         "persistent_workers": True,
-        # "prefetch_factor": 36,
+        "prefetch_factor": 4,
     } if num_workers > 0 else {}
     dataloader = DataLoader(
         dataset,

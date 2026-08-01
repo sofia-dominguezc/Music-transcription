@@ -106,15 +106,15 @@ The current architecture is a small CNN encoder followed by multiple Transformer
 
 ## TODO
 
-- Explore long-range temporal attention (accross 1min instead of 1s) and test if it improves accuracy.
+[X] Explore long-range temporal attention (accross 1min instead of 1s) and test if it improves accuracy.
 
-- Try training a larger model to see if the test accuracy plateau is a consequence of model expresivity or of data.
+[X] Try training a larger model to see if the test accuracy plateau is a consequence of model expresivity or of data.
 
-- Try different pre-processing techniques besides STFT and Constant-Q transform to see if this is why the model still has low accuracy.
+[ ] Try different pre-processing techniques besides STFT and Constant-Q transform to see if this is why the model still has low accuracy.
 
-- Once a better model is trained, implement a real time pipeline to use it.
+[ ] Once a better model is trained, implement a real time pipeline to use it.
 
-### New experiments
+## New experiments
 
 I tried the model where I take a [0.5 octaves, 0.5 seconds] block and encode it as a vector, then do attention and then decode it.
 
@@ -140,6 +140,33 @@ It's a combination of transformers and CNNs. Take the input (time, freq, dim), a
 
 I use a 5 second window with 8 samples per note. The patch size is [0.41 seconds, 0.25 octaves]
 
-- `dim=96`, `depth=3`, `400K` parameter model achieves `43.5%` accuracy 
+- `dim=96`, `depth=3`, `400K` parameter model achieves `43.5%` accuracy
 
 ![alt text](images/test_results_2.png)
+
+- `dim=128`, `depth=4`, `900K` parameter models achieves `45.3%` accuracy but starts overfitting soon after
+
+### TODO v2
+
+[ ] Factor the problem. Idea: detect onsets (at each frequency) and predict durations
+    Recall the dataset has onset and exact length information. This reduces the label space significantly
+
+[ ] Musical prior: add some form of smoothness loss and information about harmonics
+    Time: KL divergence d(p||q) seems fine (between consecutive frames). The infinities are not a problem because they are log
+    Frequency: predict chords first, then punish weird notes for the chord
+
+[ ] Consider focal loss and research other extensions that may help
+    It seems to be ideal for unbalanced data. It focuses on "hard examples" (i.e. no rewarding for easy negatives) [https://arxiv.org/pdf/1708.02002]
+
+[ ] Consider fitting an HMM to the model outputs
+
+[ ] Switch to HCQT (https://www.mdpi.com/2079-9292/10/7/810)
+
+[ ] Add new data, e.g. MAESTRO (only piano), MAPS, or MIDI files
+
+### New architecture
+
+I will try to improve the current best architecture (transformer in frequency + CNN in time). I will add a CCA component in time, so effectively each layer has three parts:
+- Self-attention over frequency
+- CNN + CCA over time (done in parallel with self-attention)
+- MLP on each patch

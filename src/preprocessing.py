@@ -1,186 +1,192 @@
 import os
-from math import ceil
-from concurrent import futures
+import csv
+import zarr
+import stat
+import shutil
 from tqdm import tqdm
-from typing import Literal
+from enum import Enum
+from typing import Iterator
+from concurrent import futures
+from dataclasses import dataclass
 
-import numpy as np
-import pandas as pd
 import librosa
+import numpy as np
 
-dataset_path = os.path.join("data", "musicnet")
-processed_path = os.path.join("data", "musicnet_processed")
+DATASET_PATH = os.path.join("data", "musicnet")
+PROCESSED_DATASET_PATH = os.path.join("data", "musicnet_processed")
+
+SR = 22050
+N_OCTAVES = 8
+TIME_CHUNK = 1024
+
+class Split(Enum):
+    TRAIN = "train"
+    TEST = "test"
 
 
-def load_song(song: str, split: Literal["train", "test"]) -> np.ndarray:
-    """Load song"""
-    song_path = f"{dataset_path}\\{split}_data\\{song}.wav"
+def _onexc_remove(func, path, exc):
+    """Remove read only files (useful for Windows One Drive)"""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def load_song(song: str, split: Split) -> np.ndarray:
+    song_path = f"{DATASET_PATH}\\{split.value}_data\\{song}.wav"
     song_vals, song_sr = librosa.load(song_path)
-    assert song_sr == 22050, "Invalid sr"
+    assert song_sr == SR, f"invalid sr {song_sr}"
     return song_vals
 
 
-def batched_q_transform(
-    song_vals: np.ndarray,
-    batch_seconds: int | float,
-    bins_per_note: int,
-    n_octaves: int,
-    sr: int,
-    hop_length: int,
+def normalized_cqt(
+    raw_song: np.ndarray, *, hop_length: int, bins_per_note: int
 ) -> np.ndarray:
-    """
-    Calculate the constant q-transform of the song and return its batched log.
-    The constant q-transform is like a FT but logarithmic in frequency.
-    """
-    # spectogram
-    raw_spect = librosa.cqt(
-        song_vals,
-        sr=sr,
+    spect = librosa.cqt(
+        raw_song,
+        sr=SR,
         hop_length=hop_length,
-        n_bins=n_octaves*bins_per_note*12,
+        n_bins=N_OCTAVES*bins_per_note*12,
         bins_per_octave=bins_per_note*12,
-        filter_scale=0.25,
-        fmin=librosa.note_to_hz('C1'),
+        filter_scale=0.5,
         scale=True,
     )
-    spect = np.abs(raw_spect.T)**0.3  # (time, freq)
-    spect = (spect - spect.mean()) / spect.std()
-    # split into batches
-    n_full_time, n_freq = spect.shape
-    n_time = int(batch_seconds * sr / hop_length)
-    n_batch = ceil(n_full_time / n_time)
-    full_spect = np.zeros((n_batch * n_time, n_freq))
-    full_spect[:n_full_time] = spect
-    return full_spect.reshape((n_batch, n_time, n_freq))
+    return np.abs(spect.T)**0.3  # (time, freq)
 
 
-def load_labels(song: str, split: Literal["train", "test"], all_notes: bool) -> pd.DataFrame:
-    """Load labels of a song. Time is in sample space"""
-    song_path = f"{dataset_path}\\{split}_labels\\{song}.csv"
-
-    with open(song_path, "r") as f:
-        df = pd.read_csv(f)
-    df = df.rename(columns={"start_time": "start", "end_time": "end"})
-
-    if not all_notes:
-        df["note"] = df["note"] % 12
-    return df[["start", "end", "note"]].astype(int)
+def load_labels(song: str, split: Split) -> Iterator[tuple[int, int, int]]:
+    song_path = f"{DATASET_PATH}\\{split.value}_labels\\{song}.csv"
+    with open(song_path, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            yield int(row['start_time']), int(row['end_time']), int(row['note'])
 
 
-def one_hot_labels(
-    raw_labels: pd.DataFrame,
-    n_batch: int,
-    n_time: int,
-    n_octaves: int,
+def get_one_hot_labels(
+    raw_labels: Iterator[tuple[int, int, int]],
+    *,
+    time_length: int,
     hop_length: int,
-    all_notes: bool,
+    only_note_names: bool,
 ) -> np.ndarray:
     """
-    Returns a boolean array determining if a given window of the stft contains
-    a note or not. Index t is the window centered at sample time t * hop_length
-
-    Args:
-        raw_labels: dataframe with (start, end, note) tuples
-        n_batch: number of batches
-        n_time: length of each batch
+    Boolean array of if a note is on or not at each of `time_length` times.
+    Uses `hop_length` as stretch factor, i.e., `song_length ~ time_length * hop_length`
     """
-    n_notes = 12 * n_octaves if all_notes else 12
-    labels = np.full((n_batch * n_time, n_notes), False, dtype=bool)
-    for _, row in raw_labels.iterrows():
-        start, end, note = row
-        note = note - 24 if all_notes else note  # NOTE: depends on n_octaves
-        if note < 0 or note >= n_notes:
-            continue
-        lower = round(start / hop_length)
-        upper = round(end / hop_length)
-        labels[lower:upper, note] = True
-    return labels.reshape(n_batch, n_time, n_notes)
+    n_notes = 12 * N_OCTAVES if not only_note_names else 12
+    labels = np.full((time_length, n_notes), False, dtype=bool)
+    for start_time, end_time, note in raw_labels:
+        if only_note_names:
+            note = note % 12
+        else:
+            note = note - 24  # shift by C1
+            if note < 0 or note >= n_notes:
+                continue
+        start_frame = round(start_time / hop_length)
+        end_frame = round(end_time / hop_length)
+        labels[start_frame:end_frame, note] = True
+    return labels
 
 
-def process_song(
-    song: str,
-    split: Literal["train", "test"],
-    batch_seconds: int | float,
-    bins_per_note: int,
-    n_octaves,
-    sr: int,
-    hop_length: int,
-    all_notes: bool,
-    batch_size: int = 60,
-):
+@dataclass(kw_only=True)
+class DataProcessor:
+    """Store spectogram of a song and corresponding one-hot labels into
+    one (time, freq) and one (time, n_notes) zarr array.
+
+    Note that with small changes to [_transform] we can save time-series directly.
     """
-    Loads song, calculates the batched spectogram, puts the labels in
-    one hot format, and saves everything to .npy files.
 
-    Args:
-        song: name of file
-        split: name of data split
-        batch_seconds: number of seconds on each batch (default 1)
-        bins_per_note: number of frequency samples between notes
-        sr: sapmling rate
-        hop_length: distance between applications of q-transform
-        all_notes: if fase, considers notese modulo 12
-        n_batches: number of batches (of size batch_seconds) to save on each file
-    """
-    song_vals = load_song(song, split)
-    spect = batched_q_transform(  # (batch, time, freq)
-        song_vals, batch_seconds, bins_per_note, n_octaves, sr, hop_length
-    ).astype(np.float16)
+    split: Split
+    bins_per_note: int = 4
+    only_note_names: bool = False
+    hop_length: int = 512
+    num_workers: int = 10
 
-    raw_labels = load_labels(song, split, all_notes)
-    labels = one_hot_labels(  # (batch, time, notes)
-        raw_labels, spect.shape[0], spect.shape[1], n_octaves, hop_length, all_notes,
-    ).astype(bool)
+    @property
+    def freq_dim(self):
+        return N_OCTAVES * 12 * self.bins_per_note
 
-    for idx in range(0, spect.shape[0], batch_size):
-        i = idx // batch_size
-        np.save(f"{processed_path}\\{split}_data\\{song}_{i}.npy", spect[idx: idx + batch_size])
-        np.save(f"{processed_path}\\{split}_labels\\{song}_{i}.npy", labels[idx: idx + batch_size])
+    @property
+    def n_notes(self):
+        return 12 * N_OCTAVES if not self.only_note_names else 12
 
+    def __post_init__(self):
+        zarr_path = f"{PROCESSED_DATASET_PATH}\\{self.split.value}.zarr"
+        shutil.rmtree(zarr_path, onexc=_onexc_remove)
+        self.zarr_group = zarr.create_group(zarr_path, overwrite=True)
 
-def process_data(split: Literal["train", "test"], num_workers: int = 8, **args):
-    """
-    Load and process all songs in parallel.
-    args: arguments for process_song
-    """
-    for info in ["data", "labels"]:
-        try:
-            os.makedirs(f"{processed_path}", exist_ok=True)
-            os.mkdir(f"{processed_path}\\{split}_{info}")
-        except FileExistsError:
-            print(
-                f"Note: {split}_{info} directory already exists. "
-                "Old files may remain there."
-            )
-            pass
-
-    executor = futures.ProcessPoolExecutor(max_workers=num_workers)
-    process_futures = []
-    print(f"Loading and processing {split}ing data and labels...")
-    for f in os.listdir(os.fsencode(f"{dataset_path}\\{split}_data")):
-        file = os.fsdecode(f)
-        song, extension = file.split('.')
-        assert extension == "wav", f"Invalid file encountered."
-        process_futures.append(
-            executor.submit(process_song, song, split, **args)
+        size = 1_000_000
+        self.zarr_group.create_array(
+            "data", shape=(size, self.freq_dim), chunks=(TIME_CHUNK, self.freq_dim), dtype=np.float32
         )
-    pbar = tqdm(total=len(process_futures))
-    for f in futures.as_completed(process_futures):
-        f.result()
-        pbar.update(1)
-    pbar.clear()
-    executor.shutdown()
+        self.zarr_group.create_array(
+            "labels", shape=(size, self.n_notes), chunks=(TIME_CHUNK, self.n_notes), dtype=bool
+        )
+        self.zarr_group.attrs["store_size"] = size
+
+        self.zarr_group.attrs["num_entries"] = 0
+        self.zarr_group.attrs["cu_seqlens"] = []
+        self.zarr_group.attrs["hop_length"] = self.hop_length
+        self.zarr_group.attrs["bins_per_note"] = self.bins_per_note
+        self.zarr_group.attrs["only_note_names"] = self.only_note_names
+
+    def _resize(self, size: int):
+        self.zarr_group['data'].resize((size, self.freq_dim))
+        self.zarr_group['labels'].resize((size, self.n_notes))
+        self.zarr_group.attrs["store_size"] = size
+
+    def _transform(self, song_name) -> tuple[np.ndarray, np.ndarray]:
+        raw_song = load_song(song_name, self.split)
+        spect = normalized_cqt(  # (time, freq)
+            raw_song,
+            hop_length=self.hop_length,
+            bins_per_note=self.bins_per_note,
+        ).astype(np.float32)
+
+        raw_labels = load_labels(song_name, self.split)
+        labels = get_one_hot_labels(  # (time, notes)
+            raw_labels,
+            time_length=spect.shape[0],
+            hop_length=self.hop_length,
+            only_note_names=self.only_note_names,
+        ).astype(np.bool)
+
+        return spect, labels
+
+    def _log(self, idx: int, data: np.ndarray, labels: np.ndarray):
+        assert (length := data.shape[0]) == labels.shape[0]
+        self.zarr_group['data'][idx: idx + length] = data
+        self.zarr_group['labels'][idx: idx + length] = labels
+        self.zarr_group.attrs["num_entries"] = idx + length
+        self.zarr_group.attrs["cu_seqlens"].append(idx)
+
+    def run(self):
+        exc = futures.ProcessPoolExecutor(max_workers=self.num_workers)
+        all_futures = []
+        for f in os.listdir(os.fsencode(f"{DATASET_PATH}\\{self.split.value}_labels")):
+            file = os.fsdecode(f)
+            song_name, ext = file.split('.')
+            if ext != "csv":
+                continue
+            all_futures.append(exc.submit(self._transform, song_name))
+
+        total = 0
+        for fs in tqdm(all_futures):
+            data, labels = fs.result()
+            new_total = total + data.shape[0]
+            if new_total > self.zarr_group.attrs["store_size"]:
+                self._resize(2 * new_total)
+            self._log(total, data, labels)
+            total = new_total
+        if total < self.zarr_group.attrs["store_size"]:
+            self._resize(total)
+        exc.shutdown()
 
 
 if __name__ == "__main__":
-    process_data(
-        split="train",
-        num_workers=12,
-        batch_seconds=5.02,
-        bins_per_note=8,
-        n_octaves=8,
-        sr=22050,
-        hop_length=256,
-        all_notes=True,
-        batch_size=1,
+    processor = DataProcessor(
+        split=Split.TEST,
+        bins_per_note=4,
+        only_note_names=False,
+        hop_length=512,
+        num_workers=10,
     )
+    processor.run()
